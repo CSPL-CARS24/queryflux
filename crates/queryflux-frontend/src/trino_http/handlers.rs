@@ -203,11 +203,15 @@ fn extract_session(headers: &HeaderMap) -> SessionContext {
     let tags = extract_trino_tags(&h);
     let user = h.get("x-trino-user").cloned();
     let database = h.get("x-trino-catalog").cloned();
+    // Agent context is NOT extracted here — it is derived lazily from `extra` in
+    // dispatch.rs via `session.resolved_agent_context()`. All HTTP frontends that
+    // store headers in `extra` (lowercase) automatically support agent headers.
     SessionContext {
         user,
         database,
         tags,
         extra: h,
+        agent_context: None,
     }
 }
 
@@ -828,7 +832,15 @@ pub async fn get_executing_statement(
         },
         query_tags: effective_tags,
         query_params: vec![],
+        agent_context: executing.agent_context.clone(),
     };
+
+    // Guard actions captured at submit time — injected into the final record_query call.
+    let submit_guard_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
+        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
+    )
+    .unwrap_or_default();
+    let submit_was_guard_blocked = executing.was_guard_blocked;
 
     match poll_result {
         QueryPollResult::Raw {
@@ -848,6 +860,8 @@ pub async fn get_executing_statement(
                         error: None,
                         routing_trace: None,
                         engine_stats,
+                        guard_actions: submit_guard_actions,
+                        was_guard_blocked: submit_was_guard_blocked,
                     },
                 );
                 state
@@ -881,6 +895,8 @@ pub async fn get_executing_statement(
                     error: Some(message.clone()),
                     routing_trace: None,
                     engine_stats: None,
+                    guard_actions: submit_guard_actions,
+                    was_guard_blocked: submit_was_guard_blocked,
                 },
             );
             let _ = cluster_manager
