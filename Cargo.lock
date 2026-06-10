@@ -3739,7 +3739,6 @@ dependencies = [
  "async-trait",
  "polyglot-sql 0.3.2",
  "queryflux-core",
- "queryflux-persistence",
  "regex",
  "serde",
  "serde_json",
