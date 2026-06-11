@@ -286,6 +286,8 @@ impl TestHarness {
             group_order,
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
@@ -296,13 +298,14 @@ impl TestHarness {
             metrics: Arc::new(CapturingMetrics {
                 records: records.clone(),
             }),
-            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             snowflake_sessions:
                 queryflux_frontend::snowflake::http::session_store::SnowflakeSessionStore::new(
                     Default::default(),
                 ),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test-harness".to_string(),
         });
 
         let trino_fe = TrinoHttpFrontend::new(state.clone(), port);

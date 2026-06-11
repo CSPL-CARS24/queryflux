@@ -320,12 +320,12 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
 
     let protocol = FrontendProtocol::MySqlWire;
 
-    // Authenticate — derive AuthContext from session (Phase 1: NoneAuthProvider).
     let creds = Credentials {
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
     };
-    let auth_ctx = match state.auth_provider.authenticate(&creds).await {
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;

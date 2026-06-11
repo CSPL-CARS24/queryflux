@@ -40,6 +40,12 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_coordination_failure(&self, operation: &str) {
+        for s in &self.stores {
+            s.on_coordination_failure(operation);
+        }
+    }
+
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         for s in &self.stores {
             if let Err(e) = s.record_query(record.clone()).await {

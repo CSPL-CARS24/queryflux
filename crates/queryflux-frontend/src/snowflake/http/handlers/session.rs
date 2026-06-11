@@ -50,13 +50,13 @@ pub async fn login_request(
             .map(|s| s.to_string())
     });
 
-    // Authenticate via QueryFlux auth provider.
     let creds = Credentials {
         username: Some(username.clone()),
         password: password.clone(),
         bearer_token: None,
     };
-    let auth_ctx = match state.auth_provider.authenticate(&creds).await {
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             warn!(user = %username, "Snowflake HTTP login auth failed: {e}");

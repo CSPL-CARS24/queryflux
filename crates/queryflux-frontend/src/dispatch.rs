@@ -119,8 +119,8 @@ pub async fn dispatch_query(
     auth_ctx: &AuthContext,
 ) -> Result<DispatchOutcome> {
     // Authorization check — first gate before any resource acquisition.
-    // Phase 1: AllowAllAuthorization always returns true (no behavior change).
-    if !state.authorization.check(auth_ctx, &group.0).await {
+    let authorization = state.live.read().await.authorization.clone();
+    if !authorization.check(auth_ctx, &group.0).await {
         return Err(QueryFluxError::Unauthorized(format!(
             "user '{}' is not authorized to run queries on cluster group '{}'",
             auth_ctx.user, group.0
@@ -147,7 +147,30 @@ pub async fn dispatch_query(
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
 
     let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
-        Some(c) => c,
+        Some(c) => {
+            // In distributed mode, also acquire a global capacity lease.
+            if let Some(cap) = &state.capacity_store {
+                let max_rq = effective_max_running(&cluster_manager, &group, &c).await;
+                match cap.try_acquire(&c.0, max_rq, &state.instance_id, &query_id.0).await {
+                    Ok(true) => {} // global slot granted
+                    Ok(false) => {
+                        // Global capacity full — release local slot and queue.
+                        let _ = cluster_manager.release_cluster(&group, &c).await;
+                        let uri = persist_queued_query(
+                            state, query_id, sql, session, protocol, group,
+                            already_queued, sequence,
+                        )
+                        .await?;
+                        return Ok(DispatchOutcome::Queued { queued_next_uri: uri });
+                    }
+                    Err(e) => {
+                        state.metrics.on_coordination_failure("capacity_acquire");
+                        tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
+                    }
+                }
+            }
+            c
+        }
         None => {
             let uri = persist_queued_query(
                 state,
@@ -177,11 +200,33 @@ pub async fn dispatch_query(
         .resolve(auth_ctx, cluster_cfg.as_ref())
         .await;
 
+    // Helper: release both local cluster slot and global capacity lease.
+    let release_slot = |state: &Arc<AppState>,
+                        mgr: &Arc<dyn ClusterGroupManager>,
+                        grp: &ClusterGroupName,
+                        cls: &ClusterName,
+                        qid: &str| {
+        let state = state.clone();
+        let mgr = mgr.clone();
+        let grp = grp.clone();
+        let cls = cls.clone();
+        let qid = qid.to_string();
+        async move {
+            let _ = mgr.release_cluster(&grp, &cls).await;
+            if let Some(cap) = &state.capacity_store {
+                if let Err(e) = cap.release(&cls.0, &qid).await {
+                    state.metrics.on_coordination_failure("capacity_release");
+                    tracing::warn!("CapacityStore release failed for query {qid}: {e}");
+                }
+            }
+        }
+    };
+
     let adapter_kind = match state.adapter(&cluster_name.0).await {
         Some(a) => a,
         None => {
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
             return Err(QueryFluxError::Engine(format!(
                 "No adapter for {group}/{cluster_name}"
             )));
@@ -207,7 +252,7 @@ pub async fn dispatch_query(
         Err(e) => {
             warn!(id = %query_id, "Translation error: {e}");
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
             return Err(e);
         }
     };
@@ -282,7 +327,7 @@ pub async fn dispatch_query(
                 },
             );
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
             return Err(QueryFluxError::Engine(deny_reason));
         }};
     }
@@ -324,7 +369,7 @@ pub async fn dispatch_query(
                 Ok(e) => e,
                 Err(e) => {
                     state.metrics.on_query_finished(&group.0, &cluster_name.0);
-                    let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+                    release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
                 }
@@ -369,7 +414,6 @@ pub async fn dispatch_query(
                     if engine_type == EngineType::Trino {
                         finalize_trino_async_terminal_on_submit(
                             state,
-                            &cluster_manager,
                             &executing,
                             &adapter,
                             &session,
@@ -504,7 +548,7 @@ pub async fn dispatch_query(
             );
 
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            release_slot(state, &cluster_manager, &group, &cluster_name, &ctx.query_id.0).await;
 
             debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
             let body_bytes = sink.into_bytes();
@@ -610,7 +654,6 @@ fn trino_submit_terminal_outcome(
 /// Collapsed from 4 branches (including JSON parse error) to a single `record_query` call.
 async fn finalize_trino_async_terminal_on_submit(
     state: &Arc<AppState>,
-    cluster_manager: &Arc<dyn ClusterGroupManager>,
     executing: &ExecutingQuery,
     adapter: &Arc<dyn AsyncAdapter>,
     session: &SessionContext,
@@ -672,14 +715,33 @@ async fn finalize_trino_async_terminal_on_submit(
         warn!(proxy_id = %executing.id, "{msg}");
     }
 
-    state
-        .metrics
-        .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
     state.record_query(&ctx, outcome);
-    let _ = cluster_manager
-        .release_cluster(&executing.cluster_group, &executing.cluster_name)
+    state
+        .release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
         .await;
     let _ = state.persistence.delete(&executing.backend_query_id).await;
+}
+
+/// Effective `max_running_queries` for a cluster, as resolved in the hot-reloaded
+/// local config (cluster override or inherited group limit) — this is what the
+/// global capacity check enforces. Falls back to unlimited if the snapshot is
+/// unavailable, consistent with the fail-open posture of distributed coordination.
+async fn effective_max_running(
+    cluster_manager: &Arc<dyn ClusterGroupManager>,
+    group: &ClusterGroupName,
+    cluster: &ClusterName,
+) -> u64 {
+    cluster_manager
+        .cluster_state(group, cluster)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.max_running_queries)
+        .unwrap_or(u64::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +798,8 @@ struct ClusterSlotGuard {
     group: ClusterGroupName,
     cluster: ClusterName,
     metrics: Arc<dyn MetricsStore>,
+    capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>>,
+    query_id: String,
     released: bool,
 }
 
@@ -745,12 +809,16 @@ impl ClusterSlotGuard {
         group: ClusterGroupName,
         cluster: ClusterName,
         metrics: Arc<dyn MetricsStore>,
+        capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>>,
+        query_id: String,
     ) -> Self {
         Self {
             cluster_manager,
             group,
             cluster,
             metrics,
+            capacity_store,
+            query_id,
             released: false,
         }
     }
@@ -763,6 +831,15 @@ impl ClusterSlotGuard {
                 .cluster_manager
                 .release_cluster(&self.group, &self.cluster)
                 .await;
+            if let Some(cap) = &self.capacity_store {
+                if let Err(e) = cap.release(&self.cluster.0, &self.query_id).await {
+                    self.metrics.on_coordination_failure("capacity_release");
+                    tracing::warn!(
+                        "CapacityStore release failed for query {}: {e}",
+                        self.query_id
+                    );
+                }
+            }
             self.metrics
                 .on_query_finished(&self.group.0, &self.cluster.0);
         }
@@ -772,15 +849,20 @@ impl ClusterSlotGuard {
 impl Drop for ClusterSlotGuard {
     fn drop(&mut self) {
         if !self.released {
-            // Cancellation path: the future was dropped while holding the slot.
-            // Spawn a best-effort release. record_query is not called here —
-            // there is no outcome to record.
             let mgr = self.cluster_manager.clone();
             let group = self.group.clone();
             let cluster = self.cluster.clone();
             let metrics = self.metrics.clone();
+            let cap = self.capacity_store.clone();
+            let qid = self.query_id.clone();
             tokio::spawn(async move {
                 let _ = mgr.release_cluster(&group, &cluster).await;
+                if let Some(cap) = cap {
+                    if let Err(e) = cap.release(&cluster.0, &qid).await {
+                        metrics.on_coordination_failure("capacity_release");
+                        tracing::warn!("CapacityStore release failed for query {qid}: {e}");
+                    }
+                }
                 metrics.on_query_finished(&group.0, &cluster.0);
             });
         }
@@ -933,20 +1015,42 @@ async fn setup_sync_query(
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
 
-    // Queue loop: spin until a cluster slot is available.
+    // Queue loop: spin until a cluster slot is available (both local and global).
     let mut seq: u64 = 0;
     let (cluster_name, adapter) = loop {
         match cluster_manager.acquire_cluster(&group).await? {
-            Some(name) => match state.adapter(&name.0).await {
-                Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
-                Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
-                None => {
-                    let _ = cluster_manager.release_cluster(&group, &name).await;
-                    return Err(QueryFluxError::Engine(format!(
-                        "No adapter for {group}/{name}"
-                    )));
+            Some(name) => {
+                // In distributed mode, also acquire a global capacity lease.
+                if let Some(cap) = &state.capacity_store {
+                    let max_rq = effective_max_running(&cluster_manager, &group, &name).await;
+                    match cap.try_acquire(&name.0, max_rq, &state.instance_id, &query_id.0).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = cluster_manager.release_cluster(&group, &name).await;
+                            queued_backoff_delay(seq).await;
+                            seq += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("capacity_acquire");
+                            tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
+                        }
+                    }
                 }
-            },
+                match state.adapter(&name.0).await {
+                    Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
+                    Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
+                    None => {
+                        let _ = cluster_manager.release_cluster(&group, &name).await;
+                        if let Some(cap) = &state.capacity_store {
+                            let _ = cap.release(&name.0, &query_id.0).await;
+                        }
+                        return Err(QueryFluxError::Engine(format!(
+                            "No adapter for {group}/{name}"
+                        )));
+                    }
+                }
+            }
             None => {
                 queued_backoff_delay(seq).await;
                 seq += 1;
@@ -966,6 +1070,8 @@ async fn setup_sync_query(
         group.clone(),
         cluster_name.clone(),
         state.metrics.clone(),
+        state.capacity_store.clone(),
+        query_id.0.clone(),
     );
 
     let src_dialect = protocol.default_dialect();
@@ -1353,7 +1459,8 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    if !state.authorization.check(auth_ctx, &group.0).await {
+    let authorization = state.live.read().await.authorization.clone();
+    if !authorization.check(auth_ctx, &group.0).await {
         let msg = format!(
             "user '{}' is not authorized to run queries on cluster group '{}'",
             auth_ctx.user, group.0

@@ -390,9 +390,9 @@ pub async fn post_statement(
     let protocol = FrontendProtocol::TrinoHttp;
 
     // 1. Authenticate — derive AuthContext from request credentials.
-    // Phase 1: NoneAuthProvider derives identity from X-Trino-User header (no crypto).
     let creds = extract_credentials(&headers);
-    let auth_ctx = match state.auth_provider.authenticate(&creds).await {
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             warn!("Authentication failed: {e}");
@@ -597,12 +597,15 @@ async fn resolve_group_for_user(
     auth_ctx: &AuthContext,
     fallback: queryflux_core::query::ClusterGroupName,
 ) -> queryflux_core::query::ClusterGroupName {
-    // Snapshot the group order under the read lock, then drop the lock before
-    // calling authorization.check (which may do async I/O, e.g. OpenFGA).
-    let group_order = state.live.read().await.group_order.clone();
+    // Snapshot the group order and authorization checker under the read lock, then drop
+    // the lock before calling authorization.check (which may do async I/O, e.g. OpenFGA).
+    let (group_order, authorization) = {
+        let live = state.live.read().await;
+        (live.group_order.clone(), live.authorization.clone())
+    };
     for group_name in &group_order {
         let group = queryflux_core::query::ClusterGroupName(group_name.clone());
-        if state.authorization.check(auth_ctx, group_name).await {
+        if authorization.check(auth_ctx, group_name).await {
             return group;
         }
     }
@@ -615,6 +618,37 @@ pub async fn get_queued_statement(
     Path((id, seq)): Path<(String, u64)>,
 ) -> impl IntoResponse {
     let query_id = ProxyQueryId(id);
+
+    // In distributed mode, try to claim ownership of this queued query so only
+    // one replica dispatches it. If another replica already claimed it, return
+    // a "still queued" response and let the client poll again.
+    //
+    // Claims are held only for the duration of one dispatch attempt. A claim
+    // older than the timeout means the claiming replica crashed mid-dispatch,
+    // so it is treated as abandoned and taken over.
+    const QUEUE_CLAIM_TIMEOUT_SECS: i64 = 60;
+    if let Some(qc) = &state.queue_coordinator {
+        let stale_before =
+            chrono::Utc::now() - chrono::Duration::seconds(QUEUE_CLAIM_TIMEOUT_SECS);
+        match qc.try_claim(&query_id.0, &state.instance_id, stale_before).await {
+            Ok(Some(_)) => {} // claimed successfully, proceed with dispatch
+            Ok(None) => {
+                // Already claimed by another replica — tell client to keep polling.
+                let next_uri = format!(
+                    "{}/v1/statement/qf/queued/{}/{}",
+                    state.external_address,
+                    query_id.0,
+                    seq + 1
+                );
+                return json_response(queued_response(&query_id.0, seq, next_uri)).into_response();
+            }
+            Err(e) => {
+                state.metrics.on_coordination_failure("queue_claim");
+                warn!("QueueCoordinator try_claim error: {e}");
+                // Fall through — allow local dispatch on coordinator failure.
+            }
+        }
+    }
 
     let queued = match state.persistence.get_queued(&query_id).await {
         Ok(Some(q)) => q,
@@ -632,16 +666,26 @@ pub async fn get_queued_statement(
     let protocol = queued.frontend_protocol.clone();
     let group = queued.cluster_group.clone();
 
-    // Re-derive AuthContext from the stored session (Phase 1: NoneAuthProvider).
     let creds = Credentials {
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
     };
-    let auth_ctx = match state.auth_provider.authenticate(&creds).await {
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             warn!("Authentication failed for queued query: {e}");
             return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+
+    let release_claim = |state: &Arc<AppState>, qid: &str| {
+        let qc = state.queue_coordinator.clone();
+        let qid = qid.to_string();
+        async move {
+            if let Some(qc) = qc {
+                let _ = qc.release_claim(&qid).await;
+            }
         }
     };
 
@@ -660,7 +704,13 @@ pub async fn get_queued_statement(
         )
         .await
         {
-            Ok(outcome) => outcome_to_response(&state, &query_id, outcome),
+            Ok(outcome) => {
+                if matches!(&outcome, DispatchOutcome::Queued { .. }) {
+                    // Re-queued (no capacity yet) — release claim so other replicas can try.
+                    release_claim(&state, &query_id.0).await;
+                }
+                outcome_to_response(&state, &query_id, outcome)
+            }
             Err(QueryFluxError::SyncEngineRequired(_)) => {
                 let _ = state.persistence.delete_queued(&query_id).await;
                 let mut sink = TrinoHttpResultSink::new(&query_id.0);
@@ -681,6 +731,7 @@ pub async fn get_queued_statement(
                 sink.into_response()
             }
             Err(e) => {
+                release_claim(&state, &query_id.0).await;
                 warn!(id = %query_id, "Dispatch error: {e}");
                 trino_error_response(&query_id.0, &e.to_string()).into_response()
             }
@@ -745,6 +796,14 @@ pub async fn get_executing_statement(
                     "Adapter for cluster {}/{} is not async",
                     executing.cluster_group, executing.cluster_name
                 );
+                state
+                    .release_query_slot(
+                        &executing.cluster_group,
+                        &executing.cluster_name,
+                        &executing.id.0,
+                    )
+                    .await;
+                let _ = state.persistence.delete(&backend_id).await;
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         },
@@ -753,6 +812,14 @@ pub async fn get_executing_statement(
                 "No adapter for cluster {}/{}",
                 executing.cluster_group, executing.cluster_name
             );
+            state
+                .release_query_slot(
+                    &executing.cluster_group,
+                    &executing.cluster_name,
+                    &executing.id.0,
+                )
+                .await;
+            let _ = state.persistence.delete(&backend_id).await;
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -782,19 +849,16 @@ pub async fn get_executing_statement(
         let _ = state.persistence.upsert(refreshed).await;
     }
 
-    // Clone the cluster manager out of the live lock before awaiting poll_query
-    // (which can block on network I/O to the backend).
-    let cluster_manager = state.live.read().await.cluster_manager.clone();
-
     let poll_result = match adapter.poll_query(&backend_id, Some(&trino_url)).await {
         Ok(r) => r,
         Err(e) => {
             warn!("Poll error: {e}");
             state
-                .metrics
-                .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
-            let _ = cluster_manager
-                .release_cluster(&executing.cluster_group, &executing.cluster_name)
+                .release_query_slot(
+                    &executing.cluster_group,
+                    &executing.cluster_name,
+                    &executing.id.0,
+                )
                 .await;
             let _ = state.persistence.delete(&backend_id).await;
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -865,10 +929,11 @@ pub async fn get_executing_statement(
                     },
                 );
                 state
-                    .metrics
-                    .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
-                let _ = cluster_manager
-                    .release_cluster(&executing.cluster_group, &executing.cluster_name)
+                    .release_query_slot(
+                        &executing.cluster_group,
+                        &executing.cluster_name,
+                        &executing.id.0,
+                    )
                     .await;
                 let _ = state.persistence.delete(&backend_id).await;
                 return raw_response_with_rewritten_next_uri(body, None).into_response();
@@ -882,9 +947,6 @@ pub async fn get_executing_statement(
         }
 
         QueryPollResult::Failed { message, .. } => {
-            state
-                .metrics
-                .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
             state.record_query(
                 &ctx,
                 QueryOutcome {
@@ -899,8 +961,12 @@ pub async fn get_executing_statement(
                     was_guard_blocked: submit_was_guard_blocked,
                 },
             );
-            let _ = cluster_manager
-                .release_cluster(&executing.cluster_group, &executing.cluster_name)
+            state
+                .release_query_slot(
+                    &executing.cluster_group,
+                    &executing.cluster_name,
+                    &executing.id.0,
+                )
                 .await;
             warn!(id = %executing.id, "Query failed: {message}");
             let _ = state.persistence.delete(&backend_id).await;
@@ -967,11 +1033,11 @@ pub async fn delete_executing_statement(
         let _ = client.delete(&trino_url).send().await;
 
         state
-            .metrics
-            .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
-        let cluster_manager = state.live.read().await.cluster_manager.clone();
-        let _ = cluster_manager
-            .release_cluster(&executing.cluster_group, &executing.cluster_name)
+            .release_query_slot(
+                &executing.cluster_group,
+                &executing.cluster_name,
+                &executing.id.0,
+            )
             .await;
         let _ = state.persistence.delete(&backend_id).await;
     }

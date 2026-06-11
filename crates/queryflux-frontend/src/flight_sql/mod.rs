@@ -183,9 +183,8 @@ impl FlightSqlService for QueryFluxFlightSql {
             bearer_token: bearer,
             ..Default::default()
         };
-        let auth_ctx = self
-            .state
-            .auth_provider
+        let auth_provider = self.state.live.read().await.auth_provider.clone();
+        let auth_ctx = auth_provider
             .authenticate(&creds)
             .await
             .map_err(|e| Status::unauthenticated(e.to_string()))?;

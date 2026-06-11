@@ -305,8 +305,8 @@ async fn authenticate(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    state
-        .auth_provider
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    auth_provider
         .authenticate(&Credentials {
             username: None,
             password: None,

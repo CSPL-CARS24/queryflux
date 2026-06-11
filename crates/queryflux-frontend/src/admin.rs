@@ -466,7 +466,9 @@ struct AdminState {
     security_config: Arc<SecurityConfigDto>,
     routing_config: Arc<RoutingConfigDto>,
     engine_registry: Arc<EngineRegistry>,
-    /// Wake the config reload task immediately after mutating persisted cluster/group/routing config.
+    /// Wake the config reload task immediately after mutating persisted config.
+    /// Uses `ConfigRevisionStore::bump_revision()` for distributed notification
+    /// and falls back to `tokio::sync::Notify` for in-memory/local-only mode.
     config_reload_notify: Arc<tokio::sync::Notify>,
     /// Snapshot of protocol listeners from startup config (YAML); not hot-reloaded.
     frontends_status: FrontendsStatusDto,
@@ -1183,8 +1185,21 @@ macro_rules! require_pg {
     };
 }
 
-#[inline]
+/// Notify all QueryFlux replicas that config has changed.
+///
+/// When a persistence backend with `ConfigRevisionStore` is available (e.g.
+/// Postgres), bumps the shared revision counter which triggers `LISTEN/NOTIFY`
+/// to all replicas. Always also wakes the local reload task via `Notify` as a
+/// fast-path for the instance that made the change.
 fn notify_live_config_reload(state: &AdminState) {
+    if let Some(store) = &state.admin_store {
+        let store = store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.bump_revision().await {
+                tracing::warn!("Failed to bump config revision: {e}");
+            }
+        });
+    }
     state.config_reload_notify.notify_one();
 }
 
@@ -1761,7 +1776,10 @@ async fn put_security_config_handler(
     };
     let value = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
     match store.set_proxy_setting("security_config", value).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_live_config_reload(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

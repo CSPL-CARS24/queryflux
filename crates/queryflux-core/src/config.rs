@@ -511,6 +511,12 @@ pub struct QueryFluxConfig {
     pub enforce_snowflake_http_session_affinity: bool,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Enable distributed (multi-instance) mode. When `true`, QueryFlux enforces global
+    /// capacity limits and config propagation via the persistence backend.
+    /// Requires `persistence.type = postgres`. Auto-detected as `true` when persistence
+    /// is Postgres; set explicitly to `false` to opt out while still using Postgres persistence.
+    #[serde(default)]
+    pub distributed: Option<bool>,
 }
 
 impl QueryFluxConfig {
@@ -525,6 +531,24 @@ impl QueryFluxConfig {
             Some(0) => None,
             Some(n) => Some(n),
         }
+    }
+
+    /// Resolve whether distributed mode is active and validate the configuration.
+    ///
+    /// `has_postgres` should be `true` when the persistence backend is Postgres.
+    /// Returns `Ok(true)` if distributed mode is active, `Ok(false)` otherwise.
+    /// Returns `Err` when distributed mode is requested but the persistence
+    /// backend cannot support coordination (i.e. InMemory).
+    pub fn resolve_distributed(&self, has_postgres: bool) -> Result<bool, String> {
+        let distributed = self.distributed.unwrap_or(has_postgres);
+        if distributed && !has_postgres {
+            return Err(
+                "Distributed mode requires persistence.type = postgres. \
+                 InMemory persistence cannot coordinate across replicas."
+                    .to_string(),
+            );
+        }
+        Ok(distributed)
     }
 }
 
@@ -1374,5 +1398,87 @@ queryflux:
             }
             _ => panic!("expected postgres"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Distributed mode config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn distributed_defaults_to_none() {
+        let cfg: ProxyConfig = serde_yaml::from_str("queryflux: {}").unwrap();
+        assert!(cfg.queryflux.distributed.is_none());
+    }
+
+    #[test]
+    fn distributed_explicit_true() {
+        let yaml = "queryflux:\n  distributed: true\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(true));
+    }
+
+    #[test]
+    fn distributed_explicit_false() {
+        let yaml = "queryflux:\n  distributed: false\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(false));
+    }
+
+    #[test]
+    fn distributed_true_with_in_memory_persistence_is_invalid_at_runtime() {
+        let yaml = r#"
+queryflux:
+  distributed: true
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(true));
+        assert!(matches!(cfg.queryflux.persistence, PersistenceConfig::InMemory));
+    }
+
+    #[test]
+    fn distributed_true_with_postgres_is_valid_at_runtime() {
+        let yaml = r#"
+queryflux:
+  distributed: true
+  persistence:
+    type: postgres
+    url: postgres://a:b@localhost:5432/db
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(true));
+        assert!(matches!(cfg.queryflux.persistence, PersistenceConfig::Postgres { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_distributed validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_distributed_auto_detects_postgres() {
+        let cfg: ProxyConfig = serde_yaml::from_str("queryflux: {}").unwrap();
+        assert!(cfg.queryflux.resolve_distributed(true).unwrap());
+        assert!(!cfg.queryflux.resolve_distributed(false).unwrap());
+    }
+
+    #[test]
+    fn resolve_distributed_explicit_true_with_postgres_ok() {
+        let yaml = "queryflux:\n  distributed: true\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.queryflux.resolve_distributed(true).unwrap());
+    }
+
+    #[test]
+    fn resolve_distributed_explicit_true_without_postgres_fails() {
+        let yaml = "queryflux:\n  distributed: true\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.queryflux.resolve_distributed(false).unwrap_err();
+        assert!(err.contains("InMemory persistence cannot coordinate"));
+    }
+
+    #[test]
+    fn resolve_distributed_explicit_false_with_postgres_ok() {
+        let yaml = "queryflux:\n  distributed: false\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.queryflux.resolve_distributed(true).unwrap());
     }
 }

@@ -25,6 +25,13 @@ pub struct PrometheusMetrics {
     /// Incremented once per tag per completed query. Allows tag-based aggregation
     /// and filtering in Prometheus/Grafana. Tags in `tags_deny_list` are not emitted.
     query_tags_total: CounterVec,
+    /// queryflux_coordination_failures_total{operation}
+    ///
+    /// Failures of distributed-coordination operations (capacity leases, queue
+    /// claims) against the persistence backend. Each failure means the replica
+    /// fell back to local-only behavior, so global limits were not enforced for
+    /// that operation — alert on a sustained rate.
+    coordination_failures_total: CounterVec,
     /// Tag keys that are excluded from `query_tags_total` to control cardinality.
     tags_deny_list: Vec<String>,
 }
@@ -87,12 +94,21 @@ impl PrometheusMetrics {
             &["tag_key", "tag_value", "cluster_group"],
         )?;
 
+        let coordination_failures_total = CounterVec::new(
+            Opts::new(
+                "queryflux_coordination_failures_total",
+                "Distributed-coordination operations that failed and fell back to local-only behavior",
+            ),
+            &["operation"],
+        )?;
+
         registry.register(Box::new(queries_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
         registry.register(Box::new(translated_total.clone()))?;
         registry.register(Box::new(running_queries.clone()))?;
         registry.register(Box::new(queued_queries.clone()))?;
         registry.register(Box::new(query_tags_total.clone()))?;
+        registry.register(Box::new(coordination_failures_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -102,6 +118,7 @@ impl PrometheusMetrics {
             running_queries,
             queued_queries,
             query_tags_total,
+            coordination_failures_total,
             tags_deny_list,
         })
     }
@@ -139,6 +156,12 @@ impl MetricsStore for PrometheusMetrics {
         if g.get() > 0.0 {
             g.dec();
         }
+    }
+
+    fn on_coordination_failure(&self, operation: &str) {
+        self.coordination_failures_total
+            .with_label_values(&[operation])
+            .inc();
     }
 
     async fn record_query(&self, record: QueryRecord) -> Result<()> {

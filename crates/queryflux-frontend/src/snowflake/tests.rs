@@ -204,6 +204,8 @@ mod snowflake_frontend {
             group_order: vec!["mock".to_string()],
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
         };
 
         let app_state = Arc::new(AppState {
@@ -212,10 +214,11 @@ mod snowflake_frontend {
             persistence: Arc::new(InMemoryPersistence::new()),
             translation: Arc::new(TranslationService::disabled()),
             metrics: Arc::new(NoopMetrics),
-            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
             snowflake_sessions: SnowflakeSessionStore::new(Default::default()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test".to_string(),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

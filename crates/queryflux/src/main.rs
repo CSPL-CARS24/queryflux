@@ -41,7 +41,7 @@ use queryflux_metrics::{
 use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, ClusterConfigStore,
-    ProxySettingsStore, RoutingConfigStore, KIND_GUARD,
+    ConfigRevisionStore, ProxySettingsStore, RoutingConfigStore, KIND_GUARD,
 };
 use queryflux_routing::{
     chain::RouterChain,
@@ -570,78 +570,8 @@ async fn main() -> Result<()> {
 
     let router_chain = RouterChain::new(routers, fallback);
 
-    // --- Build auth provider from config ---
-    use queryflux_core::config::AuthProviderConfig;
-    let auth_required = config.auth.required;
-    let auth_provider: Arc<dyn queryflux_auth::AuthProvider> = match &config.auth.provider {
-        AuthProviderConfig::None => {
-            info!("Auth provider: none (network-trust only)");
-            Arc::new(NoneAuthProvider::new(auth_required))
-        }
-        AuthProviderConfig::Static => {
-            let users = config
-                .auth
-                .static_users
-                .as_ref()
-                .context("auth.provider = static requires auth.staticUsers to be configured")?
-                .users
-                .clone();
-            info!(user_count = users.len(), "Auth provider: static");
-            Arc::new(StaticAuthProvider::new(users, auth_required))
-        }
-        AuthProviderConfig::Oidc => {
-            let oidc_cfg = config
-                .auth
-                .oidc
-                .clone()
-                .context("auth.provider = oidc requires auth.oidc to be configured")?;
-            info!(issuer = %oidc_cfg.issuer, "Auth provider: OIDC");
-            Arc::new(OidcAuthProvider::new(oidc_cfg, auth_required))
-        }
-        AuthProviderConfig::Ldap => {
-            let ldap_cfg = config
-                .auth
-                .ldap
-                .clone()
-                .context("auth.provider = ldap requires auth.ldap to be configured")?;
-            info!(url = %ldap_cfg.url, "Auth provider: LDAP");
-            Arc::new(LdapAuthProvider::new(ldap_cfg, auth_required))
-        }
-    };
-    // --- Build authorization checker from config ---
-    use queryflux_core::config::AuthorizationProviderConfig;
-    let authorization: Arc<dyn queryflux_auth::AuthorizationChecker> = match &config
-        .authorization
-        .provider
-    {
-        AuthorizationProviderConfig::None => {
-            // Build per-group allow-lists from cluster group configs.
-            // Groups with empty lists are open (allow-all), preserving backward compat.
-            let policies = config
-                .cluster_groups
-                .iter()
-                .map(|(name, cfg)| (name.clone(), cfg.authorization.clone()))
-                .collect();
-            let has_any_policy = config.cluster_groups.values().any(|cfg| {
-                !cfg.authorization.allow_groups.is_empty()
-                    || !cfg.authorization.allow_users.is_empty()
-            });
-            if has_any_policy {
-                info!("Authorization: simple allow-list policy");
-                Arc::new(SimpleAuthorizationPolicy::new(policies))
-            } else {
-                info!("Authorization: allow-all (no allow-lists configured)");
-                Arc::new(AllowAllAuthorization)
-            }
-        }
-        AuthorizationProviderConfig::OpenFga => {
-            let openfga_cfg = config.authorization.openfga.clone().context(
-                "authorization.provider = openfga requires authorization.openfga to be configured",
-            )?;
-            info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
-            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg))
-        }
-    };
+    let auth_provider = build_auth_provider(&config.auth)?;
+    let authorization = build_authorization(&config.authorization, &config.cluster_groups)?;
 
     // --- Startup validation: impersonate only valid for Trino ---
     for (name, cfg) in &config.clusters {
@@ -734,6 +664,8 @@ async fn main() -> Result<()> {
         group_order,
         group_translation_scripts,
         group_default_tags,
+        auth_provider,
+        authorization,
     };
     // Seed the reload cache. When Postgres is active, fingerprint `engine_key` + JSONB config
     // (same format as `build_live_config` on reload) so an engine change rebuilds adapters even
@@ -789,16 +721,36 @@ async fn main() -> Result<()> {
         .map(SnowflakeHttpSessionPolicy::from_frontend_config)
         .unwrap_or_default();
 
+    // Replica identity for capacity leases and queue claims. Must be unique per
+    // *process incarnation*: PIDs collide across containers (the main process is
+    // PID 1 in most pods), and a bare hostname survives container restarts —
+    // either would make this replica's heartbeat renew leases that belong to a
+    // dead instance, so they would never expire. Hostname (= pod name in
+    // Kubernetes) is included purely for debuggability; the random nonce is what
+    // guarantees uniqueness.
+    let instance_id = std::env::var("QUERYFLUX_INSTANCE_ID").unwrap_or_else(|_| {
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| format!("pid{}", std::process::id()));
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        format!("qf-{host}-{}", &nonce[..8])
+    });
+    tracing::info!(instance_id = %instance_id, "Replica instance ID");
+
+    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> =
+        pg_store.clone().map(|pg| pg as Arc<dyn queryflux_persistence::CapacityStore>);
+    let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> =
+        pg_store.clone().map(|pg| pg as Arc<dyn queryflux_persistence::QueueCoordinator>);
+
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
         live: live.clone(),
         persistence,
         translation,
         metrics,
-        auth_provider,
-        authorization,
         identity_resolver,
         snowflake_sessions: SnowflakeSessionStore::new(snowflake_session_policy),
+        capacity_store,
+        queue_coordinator,
+        instance_id,
     });
 
     // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---
@@ -874,6 +826,26 @@ async fn main() -> Result<()> {
         "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
     );
 
+    // Distributed mode detection and validation.
+    let distributed = config
+        .queryflux
+        .resolve_distributed(pg_store.is_some())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if distributed {
+        if config.queryflux.periodic_config_reload_interval_secs().is_none() {
+            tracing::warn!(
+                "Distributed mode with configReloadIntervalSecs: 0 — periodic config polling \
+                 is disabled. Config propagation relies solely on LISTEN/NOTIFY; if the \
+                 notification channel drops, replicas may become stale."
+            );
+        }
+        tracing::info!(
+            instance_id = %app_state.instance_id,
+            "Distributed mode enabled — global capacity, config revision, and queue \
+             coordination are active via Postgres"
+        );
+    }
+
     if pg_store.is_some() {
         match config.queryflux.periodic_config_reload_interval_secs() {
             None => tracing::info!(
@@ -887,6 +859,7 @@ async fn main() -> Result<()> {
     }
 
     // Background task: push cluster utilization snapshots to Prometheus every 5s.
+    // In distributed mode, also queries CapacityStore for global running counts.
     tokio::spawn({
         let state = app_state.clone();
         async move {
@@ -896,11 +869,20 @@ async fn main() -> Result<()> {
                 let cluster_manager = state.live.read().await.cluster_manager.clone();
                 if let Ok(snapshots) = cluster_manager.all_cluster_states().await {
                     for snap in snapshots {
+                        // In distributed mode, overlay global running count from CapacityStore
+                        // so metrics reflect the true cluster-wide utilization.
+                        let global_running = if let Some(cap) = &state.capacity_store {
+                            cap.active_count(&snap.cluster_name.0)
+                                .await
+                                .unwrap_or(snap.running_queries)
+                        } else {
+                            snap.running_queries
+                        };
                         let record = queryflux_metrics::ClusterSnapshot {
                             cluster_name: snap.cluster_name,
                             group_name: snap.group_name,
                             engine_type: snap.engine_type,
-                            running_queries: snap.running_queries,
+                            running_queries: global_running,
                             queued_queries: snap.queued_queries,
                             max_running_queries: snap.max_running_queries,
                             recorded_at: chrono::Utc::now(),
@@ -912,22 +894,73 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Background task: renew capacity lease heartbeats for this replica every 60s so that
+    // long-running queries on a live instance are never reclaimed by `expire_stale` (cutoff
+    // is 300s — five missed beats). Leases of crashed replicas stop heartbeating and expire.
+    if let Some(cap) = app_state.capacity_store.clone() {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = cap.heartbeat(&state.instance_id).await {
+                    state.metrics.on_coordination_failure("capacity_heartbeat");
+                    tracing::warn!("Capacity lease heartbeat failed: {e}");
+                }
+            }
+        });
+    }
+
     // Background task: release capacity for zombie executing queries (client disconnected
     // before polling to completion). Runs every 120s; evicts entries not polled for > 5 min.
     //
     // Uses `last_accessed` from persistence — updated by any proxy instance that handles
     // a poll, throttled to at most one write per 120s. Safe across multiple instances.
+    // Also expires stale capacity leases from crashed replicas.
     tokio::spawn({
         let state = app_state.clone();
+        let pg = pg_store.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
                 interval.tick().await;
+
+                // Single-owner sweep: the eviction and lease expiry below are global
+                // (idempotent, but redundant on every replica), so only the replica
+                // holding the advisory lock runs them this cycle. A crashed owner's
+                // lock is released with its connection, so another replica takes
+                // over on its next tick. On lock errors, fail open and sweep anyway.
+                let sweep_lock = match &pg {
+                    Some(pg) => match pg.try_sweep_lock("zombie-eviction").await {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => continue, // another replica owns this cycle
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("sweep_lock");
+                            tracing::warn!("Sweep lock failed, sweeping anyway: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
+                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
+
+                // Expire stale capacity leases (crashed replicas).
+                if let Some(cap) = &state.capacity_store {
+                    match cap.expire_stale(cutoff).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!("Expired {n} stale capacity leases"),
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("capacity_expire");
+                            tracing::warn!("Capacity lease expiry failed: {e}");
+                        }
+                    }
+                }
+
                 let Ok(all) = state.persistence.list_all().await else {
                     continue;
                 };
-                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
                 for q in all {
                     if q.last_accessed < cutoff {
                         tracing::warn!(
@@ -944,8 +977,21 @@ async fn main() -> Result<()> {
                         let _ = cluster_manager
                             .release_cluster(&q.cluster_group, &q.cluster_name)
                             .await;
+                        if let Some(cap) = &state.capacity_store {
+                            if let Err(e) = cap.release(&q.cluster_name.0, &q.id.0).await {
+                                state.metrics.on_coordination_failure("capacity_release");
+                                tracing::warn!(
+                                    "CapacityStore release failed for zombie query {}: {e}",
+                                    q.id
+                                );
+                            }
+                        }
                         let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
+                }
+
+                if let Some(lock) = sweep_lock {
+                    lock.release().await;
                 }
             }
         }
@@ -999,10 +1045,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Background task: hot-reload routing rules + cluster configs from the DB on a timer **or**
-    // immediately when the admin API notifies (PUT/DELETE cluster, group, or routing config).
-    // Only active when Postgres persistence is configured.
-    // `configReloadIntervalSecs: 0` disables the timer; reloads happen only on admin notify.
+    // Background task: hot-reload routing rules + cluster configs from the DB when:
+    //   1. Another replica bumps the config revision (distributed LISTEN/NOTIFY via ConfigRevisionStore)
+    //   2. This replica's admin API writes config (local tokio::sync::Notify fast-path)
+    //   3. A periodic timer fires (safety-net polling, configurable via configReloadIntervalSecs)
+    //
+    // When no Postgres persistence is configured, only local Notify triggers guard-chain reloads.
     tokio::spawn({
         let live = live.clone();
         let pg = pg_store.clone();
@@ -1010,6 +1058,24 @@ async fn main() -> Result<()> {
         let notify = config_reload_notify.clone();
         let admin_for_reload = admin_store_for_reload;
         let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
+
+        // Subscribe to distributed config revision changes (Postgres LISTEN/NOTIFY).
+        let revision_rx = if let Some(pg) = &pg {
+            match pg.subscribe_revisions().await {
+                Ok(Some(rx)) => {
+                    tracing::info!("Subscribed to Postgres config revision notifications");
+                    Some(rx)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("Failed to subscribe to config revision notifications: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         async move {
             async fn do_reload(
                 pg: &Arc<PostgresStore>,
@@ -1051,15 +1117,42 @@ async fn main() -> Result<()> {
                 }
             }
 
+            async fn do_reload_or_guard(
+                pg: &Option<Arc<PostgresStore>>,
+                cache: &tokio::sync::Mutex<AdapterReloadCache>,
+                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
+                admin: &Option<Arc<dyn AdminStore>>,
+            ) {
+                if let Some(pg) = pg {
+                    do_reload(pg, cache, live).await;
+                } else {
+                    reload_guard_chain_from_admin(admin, live).await;
+                }
+            }
+
+            // Wrap the optional receiver so we can always select on it.
+            let mut revision_rx = revision_rx;
+
+            // A future that resolves when the revision receiver gets a message,
+            // or pends forever if there is no receiver.
+            async fn recv_revision(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) -> u64 {
+                match rx {
+                    Some(rx) => rx.recv().await.unwrap_or(0),
+                    None => std::future::pending().await,
+                }
+            }
+
             match periodic_secs {
                 None => loop {
-                    notify.notified().await;
-                    tracing::debug!("Config reload requested via admin API");
-                    if let Some(pg) = &pg {
-                        do_reload(pg, &cache, &live).await;
-                    } else {
-                        reload_guard_chain_from_admin(&admin_for_reload, &live).await;
+                    tokio::select! {
+                        _ = notify.notified() => {
+                            tracing::debug!("Config reload triggered by local admin write");
+                        }
+                        rev = recv_revision(&mut revision_rx) => {
+                            tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
+                        }
                     }
+                    do_reload_or_guard(&pg, &cache, &live, &admin_for_reload).await;
                 },
                 Some(interval_secs) => {
                     let mut interval =
@@ -1069,14 +1162,13 @@ async fn main() -> Result<()> {
                         tokio::select! {
                             _ = interval.tick() => {}
                             _ = notify.notified() => {
-                                tracing::debug!("Config reload requested via admin API");
+                                tracing::debug!("Config reload triggered by local admin write");
+                            }
+                            rev = recv_revision(&mut revision_rx) => {
+                                tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
                             }
                         }
-                        if let Some(pg) = &pg {
-                            do_reload(pg, &cache, &live).await;
-                        } else {
-                            reload_guard_chain_from_admin(&admin_for_reload, &live).await;
-                        }
+                        do_reload_or_guard(&pg, &cache, &live, &admin_for_reload).await;
                     }
                 }
             }
@@ -1118,6 +1210,7 @@ async fn main() -> Result<()> {
     // Background task: reconcile in-memory running_queries counters with ground truth
     // from each engine (engines that implement fetch_running_query_count). Runs every 30s.
     // Corrects drift caused by proxy crashes, client disconnects, or any other leak.
+    // In distributed mode, local counters are a cache; CapacityStore is authoritative.
     tokio::spawn({
         let state = app_state.clone();
         async move {
@@ -1129,9 +1222,16 @@ async fn main() -> Result<()> {
                     live.health_check_targets.clone()
                 };
                 for (adapter, cstate) in &targets {
+                    // In distributed mode, sync local counter from CapacityStore (global truth).
+                    if let Some(cap) = &state.capacity_store {
+                        if let Ok(global) = cap.active_count(&cstate.cluster_name.0).await {
+                            cstate.set_running_queries(global);
+                            continue;
+                        }
+                    }
+
                     let tracked = cstate.running_queries();
                     let max = cstate.max_running_queries();
-                    // `decrement_running` used to wrap on underflow; or reload can desync counters.
                     if tracked > max {
                         let fix = adapter.fetch_running_query_count().await.unwrap_or(0);
                         tracing::warn!(
@@ -1615,6 +1715,8 @@ async fn build_live_config(
         group_order,
         group_translation_scripts,
         group_default_tags,
+        auth_provider: Arc::new(NoneAuthProvider::new(false)),
+        authorization: Arc::new(AllowAllAuthorization),
     })
 }
 
@@ -1703,7 +1805,106 @@ async fn reload_live_config(
         live.group_guard_chains = groups;
     }
 
+    // Rebuild auth/authz from persisted security config.
+    // The cluster_groups loaded above are used for per-group authorization policies.
+    if let Ok(Some(v)) = pg.get_proxy_setting("security_config").await {
+        if let Ok(auth_cfg) = serde_json::from_value::<queryflux_core::config::AuthConfig>(
+            v.get("authConfig")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
+            match build_auth_provider(&auth_cfg) {
+                Ok(provider) => live.auth_provider = provider,
+                Err(e) => tracing::warn!("Reload: failed to rebuild auth provider: {e}"),
+            }
+        }
+        if let Ok(authz_cfg) =
+            serde_json::from_value::<queryflux_core::config::AuthorizationConfig>(
+                v.get("authorizationConfig")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        {
+            match build_authorization(&authz_cfg, &cluster_groups) {
+                Ok(checker) => live.authorization = checker,
+                Err(e) => tracing::warn!("Reload: failed to rebuild authorization: {e}"),
+            }
+        }
+    }
+
     Ok(live)
+}
+
+fn build_auth_provider(
+    auth: &queryflux_core::config::AuthConfig,
+) -> Result<Arc<dyn queryflux_auth::AuthProvider>> {
+    use queryflux_core::config::AuthProviderConfig;
+    let auth_required = auth.required;
+    Ok(match &auth.provider {
+        AuthProviderConfig::None => {
+            info!("Auth provider: none (network-trust only)");
+            Arc::new(NoneAuthProvider::new(auth_required))
+        }
+        AuthProviderConfig::Static => {
+            let users = auth
+                .static_users
+                .as_ref()
+                .context("auth.provider = static requires auth.staticUsers to be configured")?
+                .users
+                .clone();
+            info!(user_count = users.len(), "Auth provider: static");
+            Arc::new(StaticAuthProvider::new(users, auth_required))
+        }
+        AuthProviderConfig::Oidc => {
+            let oidc_cfg = auth
+                .oidc
+                .clone()
+                .context("auth.provider = oidc requires auth.oidc to be configured")?;
+            info!(issuer = %oidc_cfg.issuer, "Auth provider: OIDC");
+            Arc::new(OidcAuthProvider::new(oidc_cfg, auth_required))
+        }
+        AuthProviderConfig::Ldap => {
+            let ldap_cfg = auth
+                .ldap
+                .clone()
+                .context("auth.provider = ldap requires auth.ldap to be configured")?;
+            info!(url = %ldap_cfg.url, "Auth provider: LDAP");
+            Arc::new(LdapAuthProvider::new(ldap_cfg, auth_required))
+        }
+    })
+}
+
+fn build_authorization(
+    authz: &queryflux_core::config::AuthorizationConfig,
+    cluster_groups: &HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+) -> Result<Arc<dyn queryflux_auth::AuthorizationChecker>> {
+    use queryflux_core::config::AuthorizationProviderConfig;
+    Ok(match &authz.provider {
+        AuthorizationProviderConfig::None => {
+            let policies = cluster_groups
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.authorization.clone()))
+                .collect();
+            let has_any_policy = cluster_groups.values().any(|cfg| {
+                !cfg.authorization.allow_groups.is_empty()
+                    || !cfg.authorization.allow_users.is_empty()
+            });
+            if has_any_policy {
+                info!("Authorization: simple allow-list policy");
+                Arc::new(SimpleAuthorizationPolicy::new(policies))
+            } else {
+                info!("Authorization: allow-all (no allow-lists configured)");
+                Arc::new(AllowAllAuthorization)
+            }
+        }
+        AuthorizationProviderConfig::OpenFga => {
+            let openfga_cfg = authz.openfga.clone().context(
+                "authorization.provider = openfga requires authorization.openfga to be configured",
+            )?;
+            info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
+            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg))
+        }
+    })
 }
 
 async fn load_guard_script_bodies(pg: Option<&PostgresStore>) -> HashMap<i64, String> {

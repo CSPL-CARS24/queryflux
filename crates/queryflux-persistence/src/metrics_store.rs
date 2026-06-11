@@ -115,4 +115,13 @@ pub trait MetricsStore: Send + Sync {
 
     /// Called synchronously when a cluster slot is released (query finished or failed).
     fn on_query_finished(&self, _group: &str, _cluster: &str) {}
+
+    /// Called when a distributed-coordination operation against the persistence
+    /// backend fails and the replica falls back to local-only behavior (fail-open).
+    /// `operation` is a low-cardinality label such as `capacity_acquire`,
+    /// `capacity_release`, `capacity_heartbeat`, `capacity_expire`, or `queue_claim`.
+    ///
+    /// A sustained non-zero rate means the global `max_running_queries` limit and
+    /// single-owner queue claiming are NOT being enforced — alert on it.
+    fn on_coordination_failure(&self, _operation: &str) {}
 }

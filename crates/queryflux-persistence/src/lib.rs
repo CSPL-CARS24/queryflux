@@ -223,6 +223,122 @@ pub trait RoutingConfigStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// ConfigRevisionStore — distributed config change notification
+// ---------------------------------------------------------------------------
+
+/// Tracks a monotonically increasing config revision so multiple QueryFlux
+/// replicas can detect when shared configuration has changed.
+///
+/// Every admin write that mutates persisted config (clusters, groups, routing,
+/// scripts, guardrails, security) must call [`Self::bump_revision`] so that
+/// other instances can detect the change via polling or push notification.
+///
+/// Backends that support push (e.g. Postgres `LISTEN/NOTIFY`, Redis pub/sub)
+/// implement [`Self::subscribe_revisions`] to return a live stream. Backends
+/// that cannot push (e.g. in-memory) return `None` and callers fall back to
+/// periodic polling via [`Self::current_revision`].
+#[async_trait]
+pub trait ConfigRevisionStore: Send + Sync {
+    /// Read the current global config revision.
+    async fn current_revision(&self) -> Result<u64>;
+
+    /// Atomically increment the revision and return the new value.
+    /// Must be called inside (or immediately after) every admin write.
+    async fn bump_revision(&self) -> Result<u64>;
+
+    /// Return a receiver that yields the new revision each time it changes.
+    /// `None` means push is not supported; callers should poll
+    /// [`Self::current_revision`] on a timer instead.
+    async fn subscribe_revisions(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>>;
+}
+
+// ---------------------------------------------------------------------------
+// CapacityStore — global cluster capacity coordination
+// ---------------------------------------------------------------------------
+
+/// Coordinates cluster capacity across multiple QueryFlux replicas.
+///
+/// In single-instance mode the in-memory implementation delegates to local
+/// atomics (no overhead). In distributed mode the Postgres implementation
+/// uses row-level locking or atomic updates so that `max_running_queries`
+/// is enforced globally, not per-replica.
+#[async_trait]
+pub trait CapacityStore: Send + Sync {
+    /// Atomically acquire a capacity slot for `cluster_name` if the current
+    /// global lease count is below `max_running_queries`. Returns `true` if
+    /// the slot was granted.
+    ///
+    /// The caller passes the effective limit (cluster override or inherited
+    /// group limit, as resolved in its hot-reloaded config) rather than the
+    /// store re-deriving it — the local `ClusterState` is the one place that
+    /// inheritance is already applied. Pass `u64::MAX` for unlimited.
+    ///
+    /// `instance_id` identifies the calling replica (for stale-lease expiry).
+    /// `query_id` ties the slot to a specific query (for release).
+    async fn try_acquire(
+        &self,
+        cluster_name: &str,
+        max_running_queries: u64,
+        instance_id: &str,
+        query_id: &str,
+    ) -> Result<bool>;
+
+    /// Release a previously acquired capacity slot.
+    async fn release(&self, cluster_name: &str, query_id: &str) -> Result<()>;
+
+    /// Renew the heartbeat on every lease held by `instance_id` so that
+    /// [`Self::expire_stale`] does not reclaim slots of long-running queries
+    /// on live replicas. Each replica must call this on a timer well inside
+    /// the expiry cutoff. Returns the number of leases renewed.
+    async fn heartbeat(&self, instance_id: &str) -> Result<u64>;
+
+    /// Reclaim slots whose owning instance has not heartbeated since `cutoff`.
+    async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64>;
+
+    /// Current number of active (non-expired) slots for a cluster.
+    async fn active_count(&self, cluster_name: &str) -> Result<u64>;
+}
+
+// ---------------------------------------------------------------------------
+// QueueCoordinator — single-owner queued query claiming
+// ---------------------------------------------------------------------------
+
+/// Prevents multiple replicas from dequeuing and executing the same queued
+/// query. A replica calls [`Self::try_claim`] to atomically take ownership;
+/// other replicas see the query as claimed and skip it.
+///
+/// In single-instance mode the in-memory implementation always grants the
+/// claim (there is no contention).
+#[async_trait]
+pub trait QueueCoordinator: Send + Sync {
+    /// Atomically claim an unclaimed queued query for this instance.
+    /// Returns the query if the claim succeeded, `None` if it was already
+    /// claimed by another instance or does not exist.
+    ///
+    /// A claim older than `stale_before` is treated as abandoned (the claiming
+    /// replica crashed or never finished dispatch) and may be taken over.
+    /// Claims are only held for the duration of a single dispatch attempt, so
+    /// callers should pass a cutoff of now minus a small multiple of the
+    /// expected dispatch time.
+    async fn try_claim(
+        &self,
+        query_id: &str,
+        instance_id: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Option<QueuedQuery>>;
+
+    /// Release a claim without executing (e.g. capacity still unavailable
+    /// or the claiming instance is shutting down).
+    async fn release_claim(&self, query_id: &str) -> Result<()>;
+
+    /// List queued queries that are not currently claimed by any instance.
+    /// Claims older than `stale_before` count as unclaimed.
+    async fn list_unclaimed(&self, stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>>;
+}
+
+// ---------------------------------------------------------------------------
 // AdminStore — combined super-trait used by the admin frontend
 // ---------------------------------------------------------------------------
 
@@ -238,19 +354,21 @@ pub trait AdminStore:
     + ScriptLibraryStore
     + ProxySettingsStore
     + RoutingConfigStore
+    + ConfigRevisionStore
     + Send
     + Sync
 {
 }
 
-/// Blanket implementation: any type that satisfies both component traits
-/// automatically satisfies `AdminStore`, so implementors only need the two.
+/// Blanket implementation: any type that satisfies all component traits
+/// automatically satisfies `AdminStore`, so implementors only need the components.
 impl<
         T: QueryHistoryStore
             + ClusterConfigStore
             + ScriptLibraryStore
             + ProxySettingsStore
             + RoutingConfigStore
+            + ConfigRevisionStore
             + Send
             + Sync,
     > AdminStore for T
@@ -264,12 +382,15 @@ impl<
 /// The complete interface a persistence backend must satisfy to replace Postgres.
 ///
 /// Covers all responsibilities:
-/// - `Persistence`         — in-flight query state (executing + queued)
-/// - `MetricsStore`        — writing completed query records and cluster snapshots
-/// - `QueryHistoryStore`   — reading analytics for the admin UI
-/// - `ClusterConfigStore`  — CRUD for cluster / cluster-group configuration
-/// - `ProxySettingsStore`  — persisted security / auth overrides (`security_config`)
-/// - `RoutingConfigStore`  — routing fallback + `routing_rules` rows (slices + `target_group_id`)
+/// - `Persistence`           — in-flight query state (executing + queued)
+/// - `MetricsStore`          — writing completed query records and cluster snapshots
+/// - `QueryHistoryStore`     — reading analytics for the admin UI
+/// - `ClusterConfigStore`    — CRUD for cluster / cluster-group configuration
+/// - `ProxySettingsStore`    — persisted security / auth overrides (`security_config`)
+/// - `RoutingConfigStore`    — routing fallback + `routing_rules` rows (slices + `target_group_id`)
+/// - `ConfigRevisionStore`   — distributed config revision tracking
+/// - `CapacityStore`         — global cluster capacity coordination
+/// - `QueueCoordinator`      — single-owner queued query claiming
 ///
 /// The blanket impl below means you only need to implement the component traits
 /// and you automatically satisfy `BackendStore` — no extra code required.
@@ -281,6 +402,9 @@ pub trait BackendStore:
     + ScriptLibraryStore
     + ProxySettingsStore
     + RoutingConfigStore
+    + ConfigRevisionStore
+    + CapacityStore
+    + QueueCoordinator
     + Send
     + Sync
 {
@@ -294,6 +418,9 @@ impl<
             + ScriptLibraryStore
             + ProxySettingsStore
             + RoutingConfigStore
+            + ConfigRevisionStore
+            + CapacityStore
+            + QueueCoordinator
             + Send
             + Sync,
     > BackendStore for T
