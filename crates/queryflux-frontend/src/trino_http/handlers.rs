@@ -628,9 +628,11 @@ pub async fn get_queued_statement(
     // so it is treated as abandoned and taken over.
     const QUEUE_CLAIM_TIMEOUT_SECS: i64 = 60;
     if let Some(qc) = &state.queue_coordinator {
-        let stale_before =
-            chrono::Utc::now() - chrono::Duration::seconds(QUEUE_CLAIM_TIMEOUT_SECS);
-        match qc.try_claim(&query_id.0, &state.instance_id, stale_before).await {
+        let stale_before = chrono::Utc::now() - chrono::Duration::seconds(QUEUE_CLAIM_TIMEOUT_SECS);
+        match qc
+            .try_claim(&query_id.0, &state.instance_id, stale_before)
+            .await
+        {
             Ok(Some(_)) => {} // claimed successfully, proceed with dispatch
             Ok(None) => {
                 // Already claimed by another replica — tell client to keep polling.

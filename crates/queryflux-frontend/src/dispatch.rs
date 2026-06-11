@@ -151,17 +151,28 @@ pub async fn dispatch_query(
             // In distributed mode, also acquire a global capacity lease.
             if let Some(cap) = &state.capacity_store {
                 let max_rq = effective_max_running(&cluster_manager, &group, &c).await;
-                match cap.try_acquire(&c.0, max_rq, &state.instance_id, &query_id.0).await {
+                match cap
+                    .try_acquire(&c.0, max_rq, &state.instance_id, &query_id.0)
+                    .await
+                {
                     Ok(true) => {} // global slot granted
                     Ok(false) => {
                         // Global capacity full — release local slot and queue.
                         let _ = cluster_manager.release_cluster(&group, &c).await;
                         let uri = persist_queued_query(
-                            state, query_id, sql, session, protocol, group,
-                            already_queued, sequence,
+                            state,
+                            query_id,
+                            sql,
+                            session,
+                            protocol,
+                            group,
+                            already_queued,
+                            sequence,
                         )
                         .await?;
-                        return Ok(DispatchOutcome::Queued { queued_next_uri: uri });
+                        return Ok(DispatchOutcome::Queued {
+                            queued_next_uri: uri,
+                        });
                     }
                     Err(e) => {
                         state.metrics.on_coordination_failure("capacity_acquire");
@@ -413,12 +424,7 @@ pub async fn dispatch_query(
                 if let Some(ref ib) = initial_body {
                     if engine_type == EngineType::Trino {
                         finalize_trino_async_terminal_on_submit(
-                            state,
-                            &executing,
-                            &adapter,
-                            &session,
-                            protocol,
-                            ib,
+                            state, &executing, &adapter, &session, protocol, ib,
                         )
                         .await;
                     }
@@ -548,7 +554,14 @@ pub async fn dispatch_query(
             );
 
             state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            release_slot(state, &cluster_manager, &group, &cluster_name, &ctx.query_id.0).await;
+            release_slot(
+                state,
+                &cluster_manager,
+                &group,
+                &cluster_name,
+                &ctx.query_id.0,
+            )
+            .await;
 
             debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
             let body_bytes = sink.into_bytes();
@@ -1023,7 +1036,10 @@ async fn setup_sync_query(
                 // In distributed mode, also acquire a global capacity lease.
                 if let Some(cap) = &state.capacity_store {
                     let max_rq = effective_max_running(&cluster_manager, &group, &name).await;
-                    match cap.try_acquire(&name.0, max_rq, &state.instance_id, &query_id.0).await {
+                    match cap
+                        .try_acquire(&name.0, max_rq, &state.instance_id, &query_id.0)
+                        .await
+                    {
                         Ok(true) => {}
                         Ok(false) => {
                             let _ = cluster_manager.release_cluster(&group, &name).await;

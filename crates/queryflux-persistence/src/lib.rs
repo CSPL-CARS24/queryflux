@@ -108,10 +108,7 @@ pub trait QueryHistoryStore: Send + Sync {
 
     /// Delete all query records created before `older_than` (history retention).
     /// Returns the number of records deleted.
-    async fn purge_old_query_records(
-        &self,
-        older_than: DateTime<Utc>,
-    ) -> Result<u64>;
+    async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64>;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,9 +259,7 @@ pub trait ConfigRevisionStore: Send + Sync {
     /// Return a receiver that yields the new revision each time it changes.
     /// `None` means push is not supported; callers should poll
     /// [`Self::current_revision`] on a timer instead.
-    async fn subscribe_revisions(
-        &self,
-    ) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>>;
+    async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>>;
 }
 
 // ---------------------------------------------------------------------------

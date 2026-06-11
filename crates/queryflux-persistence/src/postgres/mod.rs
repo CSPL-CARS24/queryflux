@@ -18,7 +18,7 @@ use crate::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
     },
     BackendCapabilities, CapacityStore, ClusterConfigStore, ConfigRevisionStore,
-    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueueCoordinator, QueryHistoryStore,
+    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueryHistoryStore, QueueCoordinator,
     RoutingConfigStore, ScriptLibraryStore, SweepCoordinator, SweepGuard,
 };
 use async_trait::async_trait;
@@ -81,7 +81,6 @@ impl PostgresStore {
             .map_err(|e| QueryFluxError::Persistence(format!("Migration failed: {e}")))?;
         Ok(())
     }
-
 }
 
 /// The Postgres sweep lock is a session-scoped advisory lock held on a
@@ -91,11 +90,10 @@ impl PostgresStore {
 #[async_trait]
 impl SweepCoordinator for PostgresStore {
     async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| QueryFluxError::Persistence(format!("sweep lock acquire conn: {e}")))?;
+        let mut conn =
+            self.pool.acquire().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("sweep lock acquire conn: {e}"))
+            })?;
 
         let got: bool =
             sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('sweep:' || $1)::bigint)")
@@ -402,7 +400,6 @@ impl QueryHistoryStore for PostgresStore {
         Ok(r.rows_affected())
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // ClusterConfigStore
@@ -1504,9 +1501,7 @@ impl ConfigRevisionStore for PostgresStore {
         let row: (i64,) = sqlx::query_as("SELECT revision FROM config_revision WHERE id = TRUE")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                QueryFluxError::Persistence(format!("Read config_revision: {e}"))
-            })?;
+            .map_err(|e| QueryFluxError::Persistence(format!("Read config_revision: {e}")))?;
         Ok(row.0 as u64)
     }
 
@@ -1522,17 +1517,12 @@ impl ConfigRevisionStore for PostgresStore {
         Ok(row.0 as u64)
     }
 
-    async fn subscribe_revisions(
-        &self,
-    ) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
-        let mut listener =
-            sqlx::postgres::PgListener::connect_with(&self.pool)
-                .await
-                .map_err(|e| {
-                    QueryFluxError::Persistence(format!(
-                        "PgListener connect for config_revision: {e}"
-                    ))
-                })?;
+    async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool)
+            .await
+            .map_err(|e| {
+                QueryFluxError::Persistence(format!("PgListener connect for config_revision: {e}"))
+            })?;
 
         listener
             .listen("config_revision_changed")
@@ -1549,10 +1539,7 @@ impl ConfigRevisionStore for PostgresStore {
             loop {
                 match listener.recv().await {
                     Ok(notification) => {
-                        let rev = notification
-                            .payload()
-                            .parse::<u64>()
-                            .unwrap_or(0);
+                        let rev = notification.payload().parse::<u64>().unwrap_or(0);
                         if tx.send(rev).await.is_err() {
                             break;
                         }
@@ -1655,12 +1642,11 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-        let result =
-            sqlx::query("DELETE FROM cluster_capacity_leases WHERE heartbeat_at < $1")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
+        let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE heartbeat_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
         Ok(result.rows_affected())
     }
 
@@ -1718,13 +1704,11 @@ impl QueueCoordinator for PostgresStore {
     }
 
     async fn release_claim(&self, query_id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE queued_queries SET claimed_by = NULL, claimed_at = NULL WHERE id = $1",
-        )
-        .bind(query_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("release_claim: {e}")))?;
+        sqlx::query("UPDATE queued_queries SET claimed_by = NULL, claimed_at = NULL WHERE id = $1")
+            .bind(query_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release_claim: {e}")))?;
         Ok(())
     }
 
@@ -1811,7 +1795,10 @@ mod tests {
         let store = test_store().await;
         let before = store.current_revision().await.unwrap();
         let bumped = store.bump_revision().await.unwrap();
-        assert!(bumped > before, "bumped ({bumped}) should be > before ({before})");
+        assert!(
+            bumped > before,
+            "bumped ({bumped}) should be > before ({before})"
+        );
         let after = store.current_revision().await.unwrap();
         assert_eq!(after, bumped);
     }
@@ -1821,7 +1808,10 @@ mod tests {
     async fn pg_config_revision_subscribe() {
         let store = test_store().await;
         let rx = store.subscribe_revisions().await.unwrap();
-        assert!(rx.is_some(), "Postgres should return a notification receiver");
+        assert!(
+            rx.is_some(),
+            "Postgres should return a notification receiver"
+        );
     }
 
     // -- CapacityStore ------------------------------------------------------
@@ -1852,21 +1842,42 @@ mod tests {
         let store = test_store().await;
         let cluster = unique_id("lim");
 
-        assert!(store.try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q1")).await.unwrap());
-        assert!(store.try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q2")).await.unwrap());
+        assert!(store
+            .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q1"))
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q2"))
+            .await
+            .unwrap());
         assert!(
-            !store.try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q3")).await.unwrap(),
+            !store
+                .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q3"))
+                .await
+                .unwrap(),
             "third acquire must be denied at limit 2"
         );
 
-        store.release(&cluster, &format!("{cluster}-q1")).await.unwrap();
+        store
+            .release(&cluster, &format!("{cluster}-q1"))
+            .await
+            .unwrap();
         assert!(
-            store.try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q3")).await.unwrap(),
+            store
+                .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q3"))
+                .await
+                .unwrap(),
             "slot freed by release must be grantable again"
         );
 
-        store.release(&cluster, &format!("{cluster}-q2")).await.unwrap();
-        store.release(&cluster, &format!("{cluster}-q3")).await.unwrap();
+        store
+            .release(&cluster, &format!("{cluster}-q2"))
+            .await
+            .unwrap();
+        store
+            .release(&cluster, &format!("{cluster}-q3"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1883,7 +1894,10 @@ mod tests {
 
         let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
         let expired = store.expire_stale(far_future).await.unwrap();
-        assert!(expired >= 1, "should expire at least the lease we just created");
+        assert!(
+            expired >= 1,
+            "should expire at least the lease we just created"
+        );
     }
 
     #[tokio::test]
@@ -1918,7 +1932,10 @@ mod tests {
                 granted += 1;
             }
         }
-        assert_eq!(granted, LIMIT, "exactly the limit must be granted under contention");
+        assert_eq!(
+            granted, LIMIT,
+            "exactly the limit must be granted under contention"
+        );
         assert_eq!(store.active_count(&cluster).await.unwrap(), LIMIT);
 
         for i in 0..(LIMIT * 4) {
@@ -1974,7 +1991,10 @@ mod tests {
         assert!(second.is_none(), "lock must not be granted twice");
 
         // A different sweep name does not contend.
-        let other = store.try_sweep_lock(&format!("{name}-other")).await.unwrap();
+        let other = store
+            .try_sweep_lock(&format!("{name}-other"))
+            .await
+            .unwrap();
         assert!(other.is_some(), "different sweep names are independent");
         other.unwrap().release().await;
 
@@ -1998,7 +2018,10 @@ mod tests {
         assert!(first.is_some(), "first claim should succeed");
 
         let second = store.try_claim(&qid, "inst-B", no_stale()).await.unwrap();
-        assert!(second.is_none(), "second claim by different instance should fail");
+        assert!(
+            second.is_none(),
+            "second claim by different instance should fail"
+        );
 
         store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
     }
@@ -2010,7 +2033,10 @@ mod tests {
         let qid = unique_id("st");
 
         store.upsert_queued(make_queued(&qid)).await.unwrap();
-        store.try_claim(&qid, "inst-dead", no_stale()).await.unwrap();
+        store
+            .try_claim(&qid, "inst-dead", no_stale())
+            .await
+            .unwrap();
 
         // A cutoff in the future makes the fresh claim count as stale,
         // simulating a claim whose owner crashed long ago.
@@ -2033,7 +2059,10 @@ mod tests {
         store.release_claim(&qid).await.unwrap();
 
         let reclaimed = store.try_claim(&qid, "inst-B", no_stale()).await.unwrap();
-        assert!(reclaimed.is_some(), "after release, another instance should claim");
+        assert!(
+            reclaimed.is_some(),
+            "after release, another instance should claim"
+        );
 
         store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
     }
@@ -2052,8 +2081,14 @@ mod tests {
 
         let unclaimed = store.list_unclaimed(no_stale()).await.unwrap();
         let unclaimed_ids: Vec<&str> = unclaimed.iter().map(|q| q.id.0.as_str()).collect();
-        assert!(!unclaimed_ids.contains(&qid1.as_str()), "claimed query should not appear");
-        assert!(unclaimed_ids.contains(&qid2.as_str()), "unclaimed query should appear");
+        assert!(
+            !unclaimed_ids.contains(&qid1.as_str()),
+            "claimed query should not appear"
+        );
+        assert!(
+            unclaimed_ids.contains(&qid2.as_str()),
+            "unclaimed query should appear"
+        );
 
         store.delete_queued(&ProxyQueryId(qid1)).await.unwrap();
         store.delete_queued(&ProxyQueryId(qid2)).await.unwrap();

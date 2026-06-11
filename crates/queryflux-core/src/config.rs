@@ -1437,7 +1437,10 @@ queryflux:
 "#;
         let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.queryflux.distributed, Some(true));
-        assert!(matches!(cfg.queryflux.persistence, PersistenceConfig::InMemory));
+        assert!(matches!(
+            cfg.queryflux.persistence,
+            PersistenceConfig::InMemory
+        ));
     }
 
     #[test]
@@ -1451,7 +1454,10 @@ queryflux:
 "#;
         let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.queryflux.distributed, Some(true));
-        assert!(matches!(cfg.queryflux.persistence, PersistenceConfig::Postgres { .. }));
+        assert!(matches!(
+            cfg.queryflux.persistence,
+            PersistenceConfig::Postgres { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------

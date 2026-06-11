@@ -24,7 +24,7 @@ use crate::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
     },
     BackendCapabilities, CapacityStore, ClusterConfigStore, ConfigRevisionStore,
-    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueueCoordinator, QueryHistoryStore,
+    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueryHistoryStore, QueueCoordinator,
     RoutingConfigStore, ScriptLibraryStore, SweepCoordinator, SweepGuard,
 };
 
@@ -742,9 +742,7 @@ impl ConfigRevisionStore for InMemoryPersistence {
         Ok(self.config_revision.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    async fn subscribe_revisions(
-        &self,
-    ) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
+    async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
         // In-memory mode has no cross-process notification; callers poll.
         Ok(None)
     }
@@ -1050,9 +1048,18 @@ mod tests {
     #[tokio::test]
     async fn capacity_try_acquire_always_succeeds_in_memory() {
         let store = InMemoryPersistence::new();
-        assert!(store.try_acquire("cluster1", 1, "inst-1", "q-1").await.unwrap());
-        assert!(store.try_acquire("cluster1", 1, "inst-1", "q-2").await.unwrap());
-        assert!(store.try_acquire("cluster1", 1, "inst-2", "q-3").await.unwrap());
+        assert!(store
+            .try_acquire("cluster1", 1, "inst-1", "q-1")
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire("cluster1", 1, "inst-1", "q-2")
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire("cluster1", 1, "inst-2", "q-3")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1070,10 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_expire_stale_returns_zero() {
         let store = InMemoryPersistence::new();
-        let expired = store
-            .expire_stale(chrono::Utc::now())
-            .await
-            .unwrap();
+        let expired = store.expire_stale(chrono::Utc::now()).await.unwrap();
         assert_eq!(expired, 0);
     }
 

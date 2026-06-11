@@ -161,8 +161,7 @@ impl AppState {
         cluster: &ClusterName,
         query_id: &str,
     ) {
-        self.metrics
-            .on_query_finished(&group.0, &cluster.0);
+        self.metrics.on_query_finished(&group.0, &cluster.0);
         let cluster_manager = self.live.read().await.cluster_manager.clone();
         let _ = cluster_manager.release_cluster(group, cluster).await;
         if let Some(cap) = &self.capacity_store {

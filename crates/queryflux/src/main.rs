@@ -735,16 +735,19 @@ async fn main() -> Result<()> {
     // Kubernetes) is included purely for debuggability; the random nonce is what
     // guarantees uniqueness.
     let instance_id = std::env::var("QUERYFLUX_INSTANCE_ID").unwrap_or_else(|_| {
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| format!("pid{}", std::process::id()));
+        let host =
+            std::env::var("HOSTNAME").unwrap_or_else(|_| format!("pid{}", std::process::id()));
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         format!("qf-{host}-{}", &nonce[..8])
     });
     tracing::info!(instance_id = %instance_id, "Replica instance ID");
 
-    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> =
-        backend.clone().map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>);
-    let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> =
-        backend.clone().map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>);
+    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = backend
+        .clone()
+        .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>);
+    let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = backend
+        .clone()
+        .map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>);
 
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
@@ -842,7 +845,11 @@ async fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!(e))?;
     if distributed {
-        if config.queryflux.periodic_config_reload_interval_secs().is_none() {
+        if config
+            .queryflux
+            .periodic_config_reload_interval_secs()
+            .is_none()
+        {
             tracing::warn!(
                 "Distributed mode with configReloadIntervalSecs: 0 — periodic config polling \
                  is disabled. Config propagation relies solely on LISTEN/NOTIFY; if the \
@@ -1739,7 +1746,6 @@ async fn reload_live_config(
     pg: &Arc<dyn BackendStore>,
     cache: &mut AdapterReloadCache,
 ) -> Result<LiveConfig> {
-
     let cluster_records = pg
         .list_cluster_configs()
         .await
@@ -1828,13 +1834,11 @@ async fn reload_live_config(
                 Err(e) => tracing::warn!("Reload: failed to rebuild auth provider: {e}"),
             }
         }
-        if let Ok(authz_cfg) =
-            serde_json::from_value::<queryflux_core::config::AuthorizationConfig>(
-                v.get("authorizationConfig")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-        {
+        if let Ok(authz_cfg) = serde_json::from_value::<queryflux_core::config::AuthorizationConfig>(
+            v.get("authorizationConfig")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
             match build_authorization(&authz_cfg, &cluster_groups) {
                 Ok(checker) => live.authorization = checker,
                 Err(e) => tracing::warn!("Reload: failed to rebuild authorization: {e}"),
