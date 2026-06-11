@@ -7,6 +7,8 @@ pub mod routing_json;
 pub mod routing_slices;
 pub mod script_library;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use queryflux_core::{
@@ -103,6 +105,13 @@ pub trait QueryHistoryStore: Send + Sync {
 
     /// All query records belonging to a conversation, ordered by step_index.
     async fn get_conversation(&self, conversation_id: &str) -> Result<Vec<QuerySummary>>;
+
+    /// Delete all query records created before `older_than` (history retention).
+    /// Returns the number of records deleted.
+    async fn purge_old_query_records(
+        &self,
+        older_than: DateTime<Utc>,
+    ) -> Result<u64>;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +182,10 @@ pub trait ScriptLibraryStore: Send + Sync {
         body: &UpsertUserScript,
     ) -> Result<UserScriptRecord>;
     async fn delete_user_script(&self, id: i64) -> Result<bool>;
+
+    /// Ordered translation-fixup script bodies per cluster group name, resolved
+    /// from each group's `translation_script_ids` (for `LiveConfig` reloads).
+    async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +352,44 @@ pub trait QueueCoordinator: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// SweepCoordinator — single-owner background sweeps
+// ---------------------------------------------------------------------------
+
+/// Elects a single owner for a named background sweep (e.g. zombie-query
+/// eviction) so it runs on one replica per cycle instead of all of them.
+///
+/// Implementations must guarantee a crashed owner cannot hold the lock
+/// forever (Postgres: session advisory lock released with the connection;
+/// Redis-style backends: a lock key with TTL). In single-instance mode the
+/// in-memory implementation always grants ownership.
+#[async_trait]
+pub trait SweepCoordinator: Send + Sync {
+    /// Try to become the single owner of the named sweep for this cycle.
+    /// Returns `None` when another replica currently owns it.
+    async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>>;
+}
+
+/// Ownership handle for a sweep; call [`Self::release`] when the sweep ends.
+/// Implementations must also release on drop as a fallback for early exits.
+#[async_trait]
+pub trait SweepGuard: Send {
+    async fn release(self: Box<Self>);
+}
+
+// ---------------------------------------------------------------------------
+// BackendCapabilities — startup wiring decisions
+// ---------------------------------------------------------------------------
+
+/// Capability flags consulted when wiring the proxy at startup, so behavior
+/// is keyed on what a backend can do rather than on which backend it is.
+pub trait BackendCapabilities: Send + Sync {
+    /// Whether this backend can coordinate multiple replicas: global capacity
+    /// leases, single-owner queue claims, and cross-replica config revision
+    /// notifications. Drives distributed-mode detection.
+    fn supports_distributed_coordination(&self) -> bool;
+}
+
+// ---------------------------------------------------------------------------
 // AdminStore — combined super-trait used by the admin frontend
 // ---------------------------------------------------------------------------
 
@@ -379,32 +430,33 @@ impl<
 // BackendStore — full contract for a complete persistence backend
 // ---------------------------------------------------------------------------
 
-/// The complete interface a persistence backend must satisfy to replace Postgres.
+/// The complete interface a persistence backend must satisfy to replace Postgres
+/// (e.g. a future Redis-backed store).
 ///
 /// Covers all responsibilities:
 /// - `Persistence`           — in-flight query state (executing + queued)
 /// - `MetricsStore`          — writing completed query records and cluster snapshots
-/// - `QueryHistoryStore`     — reading analytics for the admin UI
-/// - `ClusterConfigStore`    — CRUD for cluster / cluster-group configuration
-/// - `ProxySettingsStore`    — persisted security / auth overrides (`security_config`)
-/// - `RoutingConfigStore`    — routing fallback + `routing_rules` rows (slices + `target_group_id`)
-/// - `ConfigRevisionStore`   — distributed config revision tracking
+/// - `AdminStore`            — admin API surface (history analytics, cluster/group
+///   config CRUD, script library, proxy settings, routing, config revisions)
 /// - `CapacityStore`         — global cluster capacity coordination
 /// - `QueueCoordinator`      — single-owner queued query claiming
+/// - `SweepCoordinator`      — single-owner background sweeps
+/// - `BackendCapabilities`   — startup wiring decisions (distributed mode)
+///
+/// `AdminStore` is a supertrait (rather than its components) so that an
+/// `Arc<dyn BackendStore>` upcasts to every narrower trait object the wiring
+/// hands out (`Arc<dyn AdminStore>`, `Arc<dyn ProxySettingsStore>`, ...).
 ///
 /// The blanket impl below means you only need to implement the component traits
 /// and you automatically satisfy `BackendStore` — no extra code required.
 pub trait BackendStore:
     Persistence
     + MetricsStore
-    + QueryHistoryStore
-    + ClusterConfigStore
-    + ScriptLibraryStore
-    + ProxySettingsStore
-    + RoutingConfigStore
-    + ConfigRevisionStore
+    + AdminStore
     + CapacityStore
     + QueueCoordinator
+    + SweepCoordinator
+    + BackendCapabilities
     + Send
     + Sync
 {
@@ -413,14 +465,11 @@ pub trait BackendStore:
 impl<
         T: Persistence
             + MetricsStore
-            + QueryHistoryStore
-            + ClusterConfigStore
-            + ScriptLibraryStore
-            + ProxySettingsStore
-            + RoutingConfigStore
-            + ConfigRevisionStore
+            + AdminStore
             + CapacityStore
             + QueueCoordinator
+            + SweepCoordinator
+            + BackendCapabilities
             + Send
             + Sync,
     > BackendStore for T

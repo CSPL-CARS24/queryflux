@@ -17,9 +17,9 @@ use crate::{
     script_library::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
     },
-    CapacityStore, ClusterConfigStore, ConfigRevisionStore, LoadedRoutingConfig, Persistence,
-    ProxySettingsStore, QueueCoordinator, QueryHistoryStore, RoutingConfigStore,
-    ScriptLibraryStore,
+    BackendCapabilities, CapacityStore, ClusterConfigStore, ConfigRevisionStore,
+    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueueCoordinator, QueryHistoryStore,
+    RoutingConfigStore, ScriptLibraryStore, SweepCoordinator, SweepGuard,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -82,14 +82,15 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// Try to become the single owner of the named background sweep for this
-    /// cycle. Returns `None` if another replica currently holds the lock.
-    ///
-    /// The lock is a session-scoped Postgres advisory lock held on a dedicated
-    /// pooled connection inside the returned guard, so if the owning process
-    /// crashes mid-sweep, Postgres releases the lock when the connection drops
-    /// and another replica takes over on its next tick.
-    pub async fn try_sweep_lock(&self, name: &str) -> Result<Option<SweepLock>> {
+}
+
+/// The Postgres sweep lock is a session-scoped advisory lock held on a
+/// dedicated pooled connection inside the returned guard, so if the owning
+/// process crashes mid-sweep, Postgres releases the lock when the connection
+/// drops and another replica takes over on its next tick.
+#[async_trait]
+impl SweepCoordinator for PostgresStore {
+    async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
         let mut conn = self
             .pool
             .acquire()
@@ -103,10 +104,18 @@ impl PostgresStore {
                 .await
                 .map_err(|e| QueryFluxError::Persistence(format!("sweep lock try: {e}")))?;
 
-        Ok(got.then(|| SweepLock {
-            conn: Some(conn),
-            name: name.to_string(),
+        Ok(got.then(|| {
+            Box::new(SweepLock {
+                conn: Some(conn),
+                name: name.to_string(),
+            }) as Box<dyn SweepGuard>
         }))
+    }
+}
+
+impl BackendCapabilities for PostgresStore {
+    fn supports_distributed_coordination(&self) -> bool {
+        true
     }
 }
 
@@ -139,6 +148,13 @@ impl SweepLock {
         if let Some(conn) = self.conn.take() {
             Self::unlock(conn, &self.name).await;
         }
+    }
+}
+
+#[async_trait]
+impl SweepGuard for SweepLock {
+    async fn release(self: Box<Self>) {
+        SweepLock::release(*self).await;
     }
 }
 
@@ -373,11 +389,8 @@ impl QueryHistoryStore for PostgresStore {
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_conversation: {e}")))
     }
-}
 
-impl PostgresStore {
-    /// Delete all `query_records` rows older than `older_than`. Returns the number of rows deleted.
-    pub async fn purge_old_query_records(
+    async fn purge_old_query_records(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
@@ -388,27 +401,8 @@ impl PostgresStore {
             .map_err(|e| QueryFluxError::Persistence(format!("purge_old_query_records: {e}")))?;
         Ok(r.rows_affected())
     }
-
-    /// Ordered translation fixup bodies per cluster group name (for `LiveConfig`).
-    pub async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT g.name, s.body
-               FROM cluster_group_configs g
-               CROSS JOIN LATERAL unnest(g.translation_script_ids) WITH ORDINALITY AS u(sid, ord)
-               JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
-               ORDER BY g.name, u.ord"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for (name, body) in rows {
-            map.entry(name).or_default().push(body);
-        }
-        Ok(map)
-    }
 }
+
 
 // ---------------------------------------------------------------------------
 // ClusterConfigStore
@@ -903,6 +897,25 @@ impl ScriptLibraryStore for PostgresStore {
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("delete_user_script: {e}")))?;
         Ok(r.rows_affected() > 0)
+    }
+
+    async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT g.name, s.body
+               FROM cluster_group_configs g
+               CROSS JOIN LATERAL unnest(g.translation_script_ids) WITH ORDINALITY AS u(sid, ord)
+               JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
+               ORDER BY g.name, u.ord"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, body) in rows {
+            map.entry(name).or_default().push(body);
+        }
+        Ok(map)
     }
 }
 

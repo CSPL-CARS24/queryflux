@@ -1170,14 +1170,14 @@ async fn update_cluster_handler(
 // Persisted cluster config CRUD
 // ---------------------------------------------------------------------------
 
-macro_rules! require_pg {
+macro_rules! require_store {
     ($state:expr) => {
         match &$state.admin_store {
-            Some(pg) => pg,
+            Some(store) => store,
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Postgres persistence not configured",
+                    "Persistent backend not configured",
                 )
                     .into_response()
             }
@@ -1228,7 +1228,7 @@ fn rename_persistence_error_status(e: &queryflux_core::error::QueryFluxError) ->
     )
 )]
 async fn list_cluster_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.list_cluster_configs().await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1252,7 +1252,7 @@ async fn get_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.get_cluster_config(&name).await {
         Ok(Some(r)) => Json(r).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
@@ -1278,7 +1278,7 @@ async fn upsert_cluster_config_handler(
     Path(name): Path<String>,
     Json(body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1307,7 +1307,7 @@ async fn rename_cluster_config_handler(
     Path(name): Path<String>,
     Json(body): Json<RenameConfigRequest>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.rename_cluster_config(&name, &body.new_name).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1334,7 +1334,7 @@ async fn delete_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.delete_cluster_config(&name).await {
         Ok(true) => {
             notify_live_config_reload(&state);
@@ -1408,7 +1408,7 @@ async fn test_cluster_config_handler(
     )
 )]
 async fn list_group_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.list_group_configs().await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1432,7 +1432,7 @@ async fn get_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.get_group_config(&name).await {
         Ok(Some(r)) => Json(r).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
@@ -1458,7 +1458,7 @@ async fn upsert_group_config_handler(
     Path(name): Path<String>,
     Json(body): Json<UpsertClusterGroupConfig>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.upsert_group_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1487,7 +1487,7 @@ async fn rename_group_config_handler(
     Path(name): Path<String>,
     Json(body): Json<RenameConfigRequest>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.rename_group_config(&name, &body.new_name).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1515,7 +1515,7 @@ async fn delete_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.delete_group_config(&name).await {
         Ok(true) => {
             notify_live_config_reload(&state);
@@ -1561,7 +1561,7 @@ async fn list_user_scripts_handler(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<UserScriptListQuery>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     let kind = q.kind.as_deref().filter(|s| !s.is_empty());
     match pg.list_user_scripts(kind).await {
         Ok(rows) => Json(rows).into_response(),
@@ -1585,7 +1585,7 @@ async fn create_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<UpsertUserScript>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.create_user_script(&body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1612,7 +1612,7 @@ async fn get_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.get_user_script(id).await {
         Ok(Some(r)) => Json(r).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
@@ -1638,7 +1638,7 @@ async fn update_user_script_handler(
     Path(id): Path<i64>,
     Json(body): Json<UpsertUserScript>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.update_user_script(id, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1665,7 +1665,7 @@ async fn delete_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.delete_user_script(id).await {
         Ok(true) => {
             notify_live_config_reload(&state);

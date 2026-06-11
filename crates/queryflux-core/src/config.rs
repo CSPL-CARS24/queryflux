@@ -535,15 +535,20 @@ impl QueryFluxConfig {
 
     /// Resolve whether distributed mode is active and validate the configuration.
     ///
-    /// `has_postgres` should be `true` when the persistence backend is Postgres.
-    /// Returns `Ok(true)` if distributed mode is active, `Ok(false)` otherwise.
+    /// `backend_supports_coordination` is the persistence backend's
+    /// `BackendCapabilities::supports_distributed_coordination()` — `true` for
+    /// backends that can coordinate replicas (Postgres today), `false` for
+    /// InMemory. Distributed mode defaults to on whenever the backend supports
+    /// it; set `distributed: false` to opt out explicitly.
+    ///
     /// Returns `Err` when distributed mode is requested but the persistence
-    /// backend cannot support coordination (i.e. InMemory).
-    pub fn resolve_distributed(&self, has_postgres: bool) -> Result<bool, String> {
-        let distributed = self.distributed.unwrap_or(has_postgres);
-        if distributed && !has_postgres {
+    /// backend cannot coordinate across replicas.
+    pub fn resolve_distributed(&self, backend_supports_coordination: bool) -> Result<bool, String> {
+        let distributed = self.distributed.unwrap_or(backend_supports_coordination);
+        if distributed && !backend_supports_coordination {
             return Err(
-                "Distributed mode requires persistence.type = postgres. \
+                "Distributed mode requires a persistence backend that supports \
+                 multi-replica coordination (e.g. persistence.type = postgres). \
                  InMemory persistence cannot coordinate across replicas."
                     .to_string(),
             );

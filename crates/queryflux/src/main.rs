@@ -40,8 +40,7 @@ use queryflux_metrics::{
 };
 use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
-    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, ClusterConfigStore,
-    ConfigRevisionStore, ProxySettingsStore, RoutingConfigStore, KIND_GUARD,
+    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore, KIND_GUARD,
 };
 use queryflux_routing::{
     chain::RouterChain,
@@ -138,6 +137,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The durable backend behind the proxy, type-erased so that everything south
+    // of this point is wired against traits. A future backend (e.g. Redis) only
+    // needs to implement `BackendStore` and be constructed in the match above.
+    // `None` in in-memory mode, which intentionally has no durable config source.
+    let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
+
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
     let mut group_ids_by_name: HashMap<String, i64> = HashMap::new();
@@ -152,7 +157,7 @@ async fn main() -> Result<()> {
     // configs authoritative even if the volume already had older rows (e.g. switched engine).
     // **Studio-first** setups omit those maps (or leave them empty) — then nothing is written
     // here and the DB remains the source of truth for those resources.
-    if let Some(pg) = &pg_store {
+    if let Some(pg) = &backend {
         if !config.clusters.is_empty() {
             info!("Applying cluster definitions from YAML to Postgres");
             for (name, cfg) in &config.clusters {
@@ -621,7 +626,7 @@ async fn main() -> Result<()> {
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
     let cluster_configs = config.clusters.clone();
 
-    let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &pg_store {
+    let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend {
         pg.load_group_translation_bodies()
             .await
             .unwrap_or_else(|e| {
@@ -631,12 +636,13 @@ async fn main() -> Result<()> {
     } else {
         HashMap::new()
     };
-    let guard_script_bodies = load_guard_script_bodies(pg_store.as_deref()).await;
+    let guard_script_bodies =
+        load_guard_script_bodies(backend.as_deref().map(|b| b as &dyn AdminStore)).await;
 
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
     // When a persisted config exists in Postgres it is authoritative, even if it
     // resolves to an empty chain (the user may have intentionally cleared guards).
-    let (guard_chain, group_guard_chains) = if let Some(pg) = &pg_store {
+    let (guard_chain, group_guard_chains) = if let Some(pg) = &backend {
         match pg.get_proxy_setting("guardrails_config").await {
             Ok(Some(v)) => build_guard_chains_from_db_value(&v, &guard_script_bodies),
             _ => build_guard_chains(&config, &guard_script_bodies),
@@ -736,9 +742,9 @@ async fn main() -> Result<()> {
     tracing::info!(instance_id = %instance_id, "Replica instance ID");
 
     let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> =
-        pg_store.clone().map(|pg| pg as Arc<dyn queryflux_persistence::CapacityStore>);
+        backend.clone().map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>);
     let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> =
-        pg_store.clone().map(|pg| pg as Arc<dyn queryflux_persistence::QueueCoordinator>);
+        backend.clone().map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>);
 
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
@@ -755,9 +761,9 @@ async fn main() -> Result<()> {
 
     // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---
     let admin_port = config.queryflux.admin_api.port;
-    let admin_store: Option<Arc<dyn AdminStore>> = pg_store
+    let admin_store: Option<Arc<dyn AdminStore>> = backend
         .clone()
-        .map(|pg| pg as Arc<dyn AdminStore>)
+        .map(|b| b as Arc<dyn AdminStore>)
         .or_else(|| mem_store.map(|m| m as Arc<dyn AdminStore>));
     let security_config = Arc::new(AdminSecurityConfigDto::from_config(
         &config.auth,
@@ -781,9 +787,9 @@ async fn main() -> Result<()> {
         std::env::var("QUERYFLUX_ADMIN_USER").unwrap_or_else(|_| config.admin_api.username.clone());
     let admin_password = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
         .unwrap_or_else(|_| config.admin_api.password.clone());
-    let settings_store = pg_store
+    let settings_store = backend
         .clone()
-        .map(|pg| pg as Arc<dyn queryflux_persistence::ProxySettingsStore>);
+        .map(|b| b as Arc<dyn queryflux_persistence::ProxySettingsStore>);
     let admin_creds = Arc::new(queryflux_auth::AdminCredentialsManager::new(
         admin_username,
         admin_password,
@@ -829,7 +835,11 @@ async fn main() -> Result<()> {
     // Distributed mode detection and validation.
     let distributed = config
         .queryflux
-        .resolve_distributed(pg_store.is_some())
+        .resolve_distributed(
+            backend
+                .as_ref()
+                .is_some_and(|b| b.supports_distributed_coordination()),
+        )
         .map_err(|e| anyhow::anyhow!(e))?;
     if distributed {
         if config.queryflux.periodic_config_reload_interval_secs().is_none() {
@@ -842,11 +852,11 @@ async fn main() -> Result<()> {
         tracing::info!(
             instance_id = %app_state.instance_id,
             "Distributed mode enabled — global capacity, config revision, and queue \
-             coordination are active via Postgres"
+             coordination are active via the persistence backend"
         );
     }
 
-    if pg_store.is_some() {
+    if backend.is_some() {
         match config.queryflux.periodic_config_reload_interval_secs() {
             None => tracing::info!(
                 "Postgres persistence: routing rules and cluster/group config are cached in memory; periodic DB refresh is disabled (configReloadIntervalSecs: 0). Reloads still run after Studio/admin API writes."
@@ -919,7 +929,7 @@ async fn main() -> Result<()> {
     // Also expires stale capacity leases from crashed replicas.
     tokio::spawn({
         let state = app_state.clone();
-        let pg = pg_store.clone();
+        let backend = backend.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
@@ -931,8 +941,8 @@ async fn main() -> Result<()> {
                 // holding the advisory lock runs them this cycle. A crashed owner's
                 // lock is released with its connection, so another replica takes
                 // over on its next tick. On lock errors, fail open and sweep anyway.
-                let sweep_lock = match &pg {
-                    Some(pg) => match pg.try_sweep_lock("zombie-eviction").await {
+                let sweep_lock = match &backend {
+                    Some(backend) => match backend.try_sweep_lock("zombie-eviction").await {
                         Ok(Some(lock)) => Some(lock),
                         Ok(None) => continue, // another replica owns this cycle
                         Err(e) => {
@@ -1024,8 +1034,8 @@ async fn main() -> Result<()> {
     // Background task: enforce query_history_retention_days — runs hourly and deletes
     // query_records rows older than the configured retention window.
     // Only active when Postgres is configured and retention_days is set.
-    if let (Some(pg), Some(retention_days)) = (
-        pg_store.clone(),
+    if let (Some(backend), Some(retention_days)) = (
+        backend.clone(),
         config.queryflux.query_history_retention_days,
     ) {
         tokio::spawn(async move {
@@ -1034,7 +1044,7 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
-                match pg.purge_old_query_records(cutoff).await {
+                match backend.purge_old_query_records(cutoff).await {
                     Ok(0) => {}
                     Ok(n) => {
                         tracing::info!("Purged {n} query records older than {retention_days} days")
@@ -1050,20 +1060,21 @@ async fn main() -> Result<()> {
     //   2. This replica's admin API writes config (local tokio::sync::Notify fast-path)
     //   3. A periodic timer fires (safety-net polling, configurable via configReloadIntervalSecs)
     //
-    // When no Postgres persistence is configured, only local Notify triggers guard-chain reloads.
+    // When no durable backend is configured, only local Notify triggers guard-chain reloads.
     tokio::spawn({
         let live = live.clone();
-        let pg = pg_store.clone();
+        let backend = backend.clone();
         let cache = adapter_reload_cache.clone();
         let notify = config_reload_notify.clone();
         let admin_for_reload = admin_store_for_reload;
         let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
 
-        // Subscribe to distributed config revision changes (Postgres LISTEN/NOTIFY).
-        let revision_rx = if let Some(pg) = &pg {
-            match pg.subscribe_revisions().await {
+        // Subscribe to distributed config revision changes (push where the
+        // backend supports it, e.g. Postgres LISTEN/NOTIFY).
+        let revision_rx = if let Some(backend) = &backend {
+            match backend.subscribe_revisions().await {
                 Ok(Some(rx)) => {
-                    tracing::info!("Subscribed to Postgres config revision notifications");
+                    tracing::info!("Subscribed to backend config revision notifications");
                     Some(rx)
                 }
                 Ok(None) => None,
@@ -1078,15 +1089,15 @@ async fn main() -> Result<()> {
 
         async move {
             async fn do_reload(
-                pg: &Arc<PostgresStore>,
+                backend: &Arc<dyn BackendStore>,
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
             ) {
                 let mut cache_guard = cache.lock().await;
-                match reload_live_config(pg, &mut cache_guard).await {
+                match reload_live_config(backend, &mut cache_guard).await {
                     Ok(new_live) => {
                         *live.write().await = new_live;
-                        tracing::info!("Live config reloaded from Postgres");
+                        tracing::info!("Live config reloaded from backend");
                     }
                     Err(e) => tracing::warn!("Config reload failed: {e}"),
                 }
@@ -1118,13 +1129,13 @@ async fn main() -> Result<()> {
             }
 
             async fn do_reload_or_guard(
-                pg: &Option<Arc<PostgresStore>>,
+                backend: &Option<Arc<dyn BackendStore>>,
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
                 admin: &Option<Arc<dyn AdminStore>>,
             ) {
-                if let Some(pg) = pg {
-                    do_reload(pg, cache, live).await;
+                if let Some(backend) = backend {
+                    do_reload(backend, cache, live).await;
                 } else {
                     reload_guard_chain_from_admin(admin, live).await;
                 }
@@ -1152,7 +1163,7 @@ async fn main() -> Result<()> {
                             tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
                         }
                     }
-                    do_reload_or_guard(&pg, &cache, &live, &admin_for_reload).await;
+                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
                 },
                 Some(interval_secs) => {
                     let mut interval =
@@ -1168,7 +1179,7 @@ async fn main() -> Result<()> {
                                 tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
                             }
                         }
-                        do_reload_or_guard(&pg, &cache, &live, &admin_for_reload).await;
+                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
                     }
                 }
             }
@@ -1725,10 +1736,9 @@ async fn build_live_config(
 ///
 /// Cluster records are passed directly to `build_live_config` — no `to_core()` conversion.
 async fn reload_live_config(
-    pg: &Arc<queryflux_persistence::postgres::PostgresStore>,
+    pg: &Arc<dyn BackendStore>,
     cache: &mut AdapterReloadCache,
 ) -> Result<LiveConfig> {
-    use queryflux_persistence::{ClusterConfigStore, RoutingConfigStore};
 
     let cluster_records = pg
         .list_cluster_configs()
@@ -1784,7 +1794,7 @@ async fn reload_live_config(
             tracing::warn!(error = %e, "reload: load_group_translation_bodies failed");
             HashMap::new()
         });
-    let guard_script_bodies = load_guard_script_bodies(Some(pg)).await;
+    let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
 
     let mut live = build_live_config(
         &cluster_records,
@@ -1907,11 +1917,11 @@ fn build_authorization(
     })
 }
 
-async fn load_guard_script_bodies(pg: Option<&PostgresStore>) -> HashMap<i64, String> {
-    let Some(pg) = pg else {
+async fn load_guard_script_bodies(store: Option<&dyn AdminStore>) -> HashMap<i64, String> {
+    let Some(store) = store else {
         return HashMap::new();
     };
-    load_guard_script_bodies_from_admin(pg).await
+    load_guard_script_bodies_from_admin(store).await
 }
 
 async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<i64, String> {

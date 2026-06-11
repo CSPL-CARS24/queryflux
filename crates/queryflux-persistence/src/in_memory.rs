@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -22,8 +23,9 @@ use crate::{
     script_library::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
     },
-    CapacityStore, ClusterConfigStore, ConfigRevisionStore, LoadedRoutingConfig, Persistence,
-    ProxySettingsStore, QueueCoordinator, QueryHistoryStore, RoutingConfigStore, ScriptLibraryStore,
+    BackendCapabilities, CapacityStore, ClusterConfigStore, ConfigRevisionStore,
+    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueueCoordinator, QueryHistoryStore,
+    RoutingConfigStore, ScriptLibraryStore, SweepCoordinator, SweepGuard,
 };
 
 pub struct InMemoryPersistence {
@@ -335,6 +337,13 @@ impl QueryHistoryStore for InMemoryPersistence {
 
     async fn get_conversation(&self, _conversation_id: &str) -> Result<Vec<QuerySummary>> {
         Ok(vec![])
+    }
+
+    async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64> {
+        let mut records = self.query_records.write().unwrap();
+        let before = records.len();
+        records.retain(|r| r.created_at >= older_than);
+        Ok((before - records.len()) as u64)
     }
 }
 
@@ -697,6 +706,26 @@ impl ScriptLibraryStore for InMemoryPersistence {
         }
         Ok(self.user_scripts.remove(&id).is_some())
     }
+
+    async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for group in self.group_configs.iter() {
+            let bodies: Vec<String> = group
+                .translation_script_ids
+                .iter()
+                .filter_map(|sid| {
+                    self.user_scripts
+                        .get(sid)
+                        .filter(|s| s.kind == KIND_TRANSLATION_FIXUP)
+                        .map(|s| s.body.clone())
+                })
+                .collect();
+            if !bodies.is_empty() {
+                map.insert(group.name.clone(), bodies);
+            }
+        }
+        Ok(map)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +808,30 @@ impl QueueCoordinator for InMemoryPersistence {
     async fn list_unclaimed(&self, _stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
         // Single instance — all queued queries are effectively unclaimed.
         Ok(self.queued.iter().map(|e| e.value().clone()).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SweepCoordinator — pass-through (single instance always owns every sweep)
+// ---------------------------------------------------------------------------
+
+struct NoopSweepGuard;
+
+#[async_trait]
+impl SweepGuard for NoopSweepGuard {
+    async fn release(self: Box<Self>) {}
+}
+
+#[async_trait]
+impl SweepCoordinator for InMemoryPersistence {
+    async fn try_sweep_lock(&self, _name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
+        Ok(Some(Box::new(NoopSweepGuard)))
+    }
+}
+
+impl BackendCapabilities for InMemoryPersistence {
+    fn supports_distributed_coordination(&self) -> bool {
+        false
     }
 }
 
