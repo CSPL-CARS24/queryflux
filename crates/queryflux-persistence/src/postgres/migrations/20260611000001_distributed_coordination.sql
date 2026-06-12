@@ -58,6 +58,15 @@ CREATE INDEX cluster_capacity_leases_heartbeat
 CREATE INDEX cluster_capacity_leases_instance
     ON cluster_capacity_leases (instance_id);
 
+-- O(1) admission counter per cluster: try_acquire increments under the row
+-- lock in a single statement instead of COUNT(*) under an advisory lock.
+-- The leases table stays the ground truth for crash recovery; the single-owner
+-- sweep reconciles these counters from it on every expiry cycle.
+CREATE TABLE IF NOT EXISTS cluster_capacity_counters (
+    cluster_name TEXT   PRIMARY KEY,
+    running      BIGINT NOT NULL DEFAULT 0 CHECK (running >= 0)
+);
+
 -- ---------------------------------------------------------------------------
 -- Queue claims — claim columns on queued_queries so only one replica
 -- processes a given queued query.

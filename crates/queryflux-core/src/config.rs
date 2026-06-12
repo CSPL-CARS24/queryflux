@@ -625,6 +625,12 @@ pub struct PostgresPersistenceConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
+    /// Max connections in the sqlx pool (`poolSize` in YAML). Omit for the
+    /// sqlx default (10). The pool serves the dispatch hot path (capacity
+    /// acquire/release per query) plus persistence, admin, LISTEN/NOTIFY,
+    /// and sweeps — raise this before adding replicas under high QPS.
+    #[serde(default)]
+    pub pool_size: Option<u32>,
 }
 
 impl PostgresPersistenceConfig {
@@ -1356,6 +1362,7 @@ guardrails:
             password: Some("secret@x".into()),
             database: Some("queryflux".into()),
             url: None,
+            ..Default::default()
         };
         let u = c.connection_url().unwrap();
         assert!(u.starts_with("postgres://"));

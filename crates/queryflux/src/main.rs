@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
                 .connection_url()
                 .map_err(|m| anyhow::anyhow!("Invalid postgres persistence config: {m}"))?;
             let pg = Arc::new(
-                PostgresStore::connect(&url)
+                PostgresStore::connect_with_pool_size(&url, conn.pool_size)
                     .await
                     .context("Failed to connect to Postgres")?,
             );
@@ -830,7 +830,7 @@ async fn main() -> Result<()> {
 
     let admin_store_for_reload = admin_store.clone();
     let admin = AdminFrontend::new(
-        prometheus,
+        prometheus.clone(),
         live.clone(),
         admin_store,
         admin_port,
@@ -882,36 +882,75 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Background task: push cluster utilization snapshots to Prometheus every 5s.
+    // Background task: push cluster utilization snapshots every 5s.
     // In distributed mode, also queries CapacityStore for global running counts.
+    //
+    // Every replica refreshes its *local* Prometheus gauges (each replica's
+    // /metrics is scraped independently), but only the replica holding the
+    // sweep lock persists history rows to the backend — otherwise R replicas
+    // write R duplicate rows per cluster per tick and Studio's history tables
+    // grow R times faster.
     tokio::spawn({
         let state = app_state.clone();
+        let prometheus = prometheus.clone();
+        let backend = backend.clone();
+        let distributed_backend = distributed_backend.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 let cluster_manager = state.live.read().await.cluster_manager.clone();
-                if let Ok(snapshots) = cluster_manager.all_cluster_states().await {
-                    for snap in snapshots {
-                        // In distributed mode, overlay global running count from CapacityStore
-                        // so metrics reflect the true cluster-wide utilization.
-                        let global_running = if let Some(cap) = &state.capacity_store {
-                            cap.active_count(&snap.cluster_name.0)
-                                .await
-                                .unwrap_or(snap.running_queries)
-                        } else {
-                            snap.running_queries
-                        };
-                        let record = queryflux_metrics::ClusterSnapshot {
-                            cluster_name: snap.cluster_name,
-                            group_name: snap.group_name,
-                            engine_type: snap.engine_type,
-                            running_queries: global_running,
-                            queued_queries: snap.queued_queries,
-                            max_running_queries: snap.max_running_queries,
-                            recorded_at: chrono::Utc::now(),
-                        };
-                        let _ = state.metrics.record_cluster_snapshot(record).await;
+                let Ok(snapshots) = cluster_manager.all_cluster_states().await else {
+                    continue;
+                };
+                let mut records = Vec::with_capacity(snapshots.len());
+                for snap in snapshots {
+                    // In distributed mode, overlay global running count from CapacityStore
+                    // so metrics reflect the true cluster-wide utilization.
+                    let global_running = if let Some(cap) = &state.capacity_store {
+                        cap.active_count(&snap.cluster_name.0)
+                            .await
+                            .unwrap_or(snap.running_queries)
+                    } else {
+                        snap.running_queries
+                    };
+                    records.push(queryflux_metrics::ClusterSnapshot {
+                        cluster_name: snap.cluster_name,
+                        group_name: snap.group_name,
+                        engine_type: snap.engine_type,
+                        running_queries: global_running,
+                        queued_queries: snap.queued_queries,
+                        max_running_queries: snap.max_running_queries,
+                        recorded_at: chrono::Utc::now(),
+                    });
+                }
+                for record in &records {
+                    let _ = prometheus.record_cluster_snapshot(record.clone()).await;
+                }
+                // History rows go to the durable backend. When the backend can
+                // coordinate, only the sweep-lock owner persists this cycle; a
+                // coordination failure fails open (duplicate rows beat no rows).
+                // A non-coordinating backend persists unconditionally — it
+                // cannot dedup across replicas anyway.
+                let lock = match &distributed_backend {
+                    Some(db) => match db.try_sweep_lock("cluster-snapshots").await {
+                        Ok(Some(lock)) => Some(Some(lock)),
+                        Ok(None) => None, // another replica persists this cycle
+                        Err(e) => {
+                            tracing::debug!("Snapshot sweep lock failed: {e}");
+                            Some(None)
+                        }
+                    },
+                    None => Some(None),
+                };
+                if let Some(lock) = lock {
+                    if let Some(backend) = &backend {
+                        for record in records {
+                            let _ = backend.record_cluster_snapshot(record).await;
+                        }
+                    }
+                    if let Some(lock) = lock {
+                        lock.release().await;
                     }
                 }
             }
@@ -1169,6 +1208,18 @@ async fn main() -> Result<()> {
             // Wrap the optional receiver so we can always select on it.
             let mut revision_rx = revision_rx;
 
+            // Coalesce notification bursts: a bulk admin save bumps the revision
+            // once per write, and each bump is one channel message — without
+            // draining, N rapid writes would trigger N full reloads (adapter
+            // rebuilds included) on every replica. A short settle window lets
+            // writes a few hundred ms apart collapse into one reload too.
+            async fn coalesce_revisions(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) {
+                if let Some(rx) = rx.as_mut() {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    while rx.try_recv().is_ok() {}
+                }
+            }
+
             // A future that resolves when the revision receiver gets a message,
             // or pends forever if there is no receiver. A closed channel (the
             // LISTEN/NOTIFY task died) drops the receiver so we don't spin on
@@ -1200,6 +1251,7 @@ async fn main() -> Result<()> {
                             tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
                         }
                     }
+                    coalesce_revisions(&mut revision_rx).await;
                     do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
                 },
                 Some(interval_secs) => {
@@ -1216,6 +1268,7 @@ async fn main() -> Result<()> {
                                 tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
                             }
                         }
+                        coalesce_revisions(&mut revision_rx).await;
                         do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
                     }
                 }

@@ -186,6 +186,19 @@ pub async fn dispatch_query(
         }
     };
 
+    // RAII guard: from here on the local slot and global lease are released on
+    // every exit — including the future being dropped when the client
+    // disconnects mid-dispatch, which previously leaked the lease permanently
+    // (the owning replica keeps heartbeating, so expiry never reclaims it).
+    let mut slot = ClusterSlotGuard::new(
+        cluster_manager.clone(),
+        group.clone(),
+        cluster_name.clone(),
+        state.metrics.clone(),
+        state.capacity_store.clone(),
+        query_id.0.clone(),
+    );
+
     let (cluster_group_config_id, cluster_config_id) =
         cluster_db_ids(&cluster_manager, &group, &cluster_name).await;
 
@@ -197,33 +210,10 @@ pub async fn dispatch_query(
         .resolve(auth_ctx, cluster_cfg.as_ref())
         .await;
 
-    // Helper: release both local cluster slot and global capacity lease.
-    let release_slot = |state: &Arc<AppState>,
-                        mgr: &Arc<dyn ClusterGroupManager>,
-                        grp: &ClusterGroupName,
-                        cls: &ClusterName,
-                        qid: &str| {
-        let state = state.clone();
-        let mgr = mgr.clone();
-        let grp = grp.clone();
-        let cls = cls.clone();
-        let qid = qid.to_string();
-        async move {
-            let _ = mgr.release_cluster(&grp, &cls).await;
-            if let Some(cap) = &state.capacity_store {
-                if let Err(e) = cap.release(&cls.0, &qid).await {
-                    state.metrics.on_coordination_failure("capacity_release");
-                    tracing::warn!("CapacityStore release failed for query {qid}: {e}");
-                }
-            }
-        }
-    };
-
     let adapter_kind = match state.adapter(&cluster_name.0).await {
         Some(a) => a,
         None => {
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
+            slot.release().await;
             return Err(QueryFluxError::Engine(format!(
                 "No adapter for {group}/{cluster_name}"
             )));
@@ -248,8 +238,7 @@ pub async fn dispatch_query(
         Ok(t) => t,
         Err(e) => {
             warn!(id = %query_id, "Translation error: {e}");
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
+            slot.release().await;
             return Err(e);
         }
     };
@@ -323,8 +312,7 @@ pub async fn dispatch_query(
                     was_guard_blocked: true,
                 },
             );
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
+            slot.release().await;
             return Err(QueryFluxError::Engine(deny_reason));
         }};
     }
@@ -365,8 +353,7 @@ pub async fn dispatch_query(
             {
                 Ok(e) => e,
                 Err(e) => {
-                    state.metrics.on_query_finished(&group.0, &cluster_name.0);
-                    release_slot(state, &cluster_manager, &group, &cluster_name, &query_id.0).await;
+                    slot.release().await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
                 }
@@ -403,7 +390,19 @@ pub async fn dispatch_query(
                 submitted_guard_actions,
                 was_guard_blocked: false,
             };
-            let _ = state.persistence.upsert(executing.clone()).await;
+            // Slot ownership transfers to the executing record: poll, cancel,
+            // and zombie-eviction paths release it from here on. If the record
+            // can't be persisted, no terminal path would ever see this query —
+            // release the slot and fail the dispatch (the engine-side query is
+            // orphaned either way, but capacity accounting stays correct).
+            if let Err(e) = state.persistence.upsert(executing.clone()).await {
+                warn!(id = %query_id, "Failed to persist executing query: {e}");
+                slot.release().await;
+                return Err(QueryFluxError::Persistence(format!(
+                    "persist executing query: {e}"
+                )));
+            }
+            slot.disarm();
             info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
 
             if next_uri.is_none() {
@@ -539,15 +538,7 @@ pub async fn dispatch_query(
                 },
             );
 
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            release_slot(
-                state,
-                &cluster_manager,
-                &group,
-                &cluster_name,
-                &ctx.query_id.0,
-            )
-            .await;
+            slot.release().await;
 
             debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
             let body_bytes = sink.into_bytes();
@@ -850,6 +841,13 @@ impl ClusterSlotGuard {
             query_id,
             released: false,
         }
+    }
+
+    /// Transfer slot ownership out of this guard without releasing — used when
+    /// an async query has been durably persisted as executing and the terminal
+    /// paths (poll, cancel, zombie eviction) become responsible for the release.
+    fn disarm(&mut self) {
+        self.released = true;
     }
 
     /// Release the slot on the normal path. Idempotent — safe to call twice.
