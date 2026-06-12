@@ -148,37 +148,23 @@ pub async fn dispatch_query(
 
     let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
         Some(c) => {
-            // In distributed mode, also acquire a global capacity lease.
-            if let Some(cap) = &state.capacity_store {
-                let max_rq = effective_max_running(&cluster_manager, &group, &c).await;
-                match cap
-                    .try_acquire(&c.0, max_rq, &state.instance_id, &query_id.0)
-                    .await
-                {
-                    Ok(true) => {} // global slot granted
-                    Ok(false) => {
-                        // Global capacity full — release local slot and queue.
-                        let _ = cluster_manager.release_cluster(&group, &c).await;
-                        let uri = persist_queued_query(
-                            state,
-                            query_id,
-                            sql,
-                            session,
-                            protocol,
-                            group,
-                            already_queued,
-                            sequence,
-                        )
-                        .await?;
-                        return Ok(DispatchOutcome::Queued {
-                            queued_next_uri: uri,
-                        });
-                    }
-                    Err(e) => {
-                        state.metrics.on_coordination_failure("capacity_acquire");
-                        tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
-                    }
-                }
+            if !acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
+                // Global capacity full — release local slot and queue.
+                let _ = cluster_manager.release_cluster(&group, &c).await;
+                let uri = persist_queued_query(
+                    state,
+                    query_id,
+                    sql,
+                    session,
+                    protocol,
+                    group,
+                    already_queued,
+                    sequence,
+                )
+                .await?;
+                return Ok(DispatchOutcome::Queued {
+                    queued_next_uri: uri,
+                });
             }
             c
         }
@@ -757,6 +743,36 @@ async fn effective_max_running(
         .unwrap_or(u64::MAX)
 }
 
+/// In distributed mode, take a global capacity lease for a cluster slot that
+/// was just acquired locally. Returns `false` when global capacity is full —
+/// the caller must release the local slot and queue or back off. Coordination
+/// failures fail open (proceed on local limits alone) and are counted in
+/// `queryflux_coordination_failures_total`. Always `true` outside distributed
+/// mode.
+async fn acquire_global_capacity(
+    state: &Arc<AppState>,
+    cluster_manager: &Arc<dyn ClusterGroupManager>,
+    group: &ClusterGroupName,
+    cluster: &ClusterName,
+    query_id: &str,
+) -> bool {
+    let Some(cap) = &state.capacity_store else {
+        return true;
+    };
+    let max_rq = effective_max_running(cluster_manager, group, cluster).await;
+    match cap
+        .try_acquire(&cluster.0, max_rq, &state.instance_id, query_id)
+        .await
+    {
+        Ok(granted) => granted,
+        Err(e) => {
+            state.metrics.on_coordination_failure("capacity_acquire");
+            tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
+            true
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_queued_query(
     state: &Arc<AppState>,
@@ -1033,25 +1049,14 @@ async fn setup_sync_query(
     let (cluster_name, adapter) = loop {
         match cluster_manager.acquire_cluster(&group).await? {
             Some(name) => {
-                // In distributed mode, also acquire a global capacity lease.
-                if let Some(cap) = &state.capacity_store {
-                    let max_rq = effective_max_running(&cluster_manager, &group, &name).await;
-                    match cap
-                        .try_acquire(&name.0, max_rq, &state.instance_id, &query_id.0)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let _ = cluster_manager.release_cluster(&group, &name).await;
-                            queued_backoff_delay(seq).await;
-                            seq += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            state.metrics.on_coordination_failure("capacity_acquire");
-                            tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
-                        }
-                    }
+                if !acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
+                    .await
+                {
+                    // Global capacity full — release local slot and retry with backoff.
+                    let _ = cluster_manager.release_cluster(&group, &name).await;
+                    queued_backoff_delay(seq).await;
+                    seq += 1;
+                    continue;
                 }
                 match state.adapter(&name.0).await {
                     Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),

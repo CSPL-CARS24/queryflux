@@ -160,11 +160,16 @@ impl Drop for SweepLock {
     fn drop(&mut self) {
         // Fallback for early exits (`continue`, `?`): spawn the unlock so the
         // connection never returns to the pool still holding the session lock.
+        // `tokio::spawn` panics outside a runtime (e.g. process teardown), so
+        // check first; without a runtime, dropping the connection closes it,
+        // which releases the session-scoped lock server-side.
         if let Some(conn) = self.conn.take() {
-            let name = std::mem::take(&mut self.name);
-            tokio::spawn(async move {
-                Self::unlock(conn, &name).await;
-            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let name = std::mem::take(&mut self.name);
+                handle.spawn(async move {
+                    Self::unlock(conn, &name).await;
+                });
+            }
         }
     }
 }
