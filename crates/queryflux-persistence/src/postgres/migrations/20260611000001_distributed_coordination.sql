@@ -9,7 +9,9 @@
 
 CREATE TABLE IF NOT EXISTS config_revision (
     id       BOOLEAN     PRIMARY KEY DEFAULT TRUE CHECK (id),
-    revision BIGINT      NOT NULL DEFAULT 0,
+    -- Read as u64 in Rust; reject negative writes (only possible via manual
+    -- tampering — the application only ever increments from 0).
+    revision BIGINT      NOT NULL DEFAULT 0 CHECK (revision >= 0),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
