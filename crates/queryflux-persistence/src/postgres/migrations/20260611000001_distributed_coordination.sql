@@ -67,6 +67,14 @@ ALTER TABLE queued_queries
     ADD COLUMN IF NOT EXISTS claimed_by TEXT,
     ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
 
+-- try_claim sets both columns and release_claim clears both; enforce the
+-- pairing so the stale-claim predicates (claimed_at < cutoff) can never see
+-- a half-written claim from a manual fix-up. No backfill needed: the columns
+-- are created in this migration, so no inconsistent rows can pre-exist.
+ALTER TABLE queued_queries
+    ADD CONSTRAINT queued_queries_claim_pair_chk
+    CHECK ((claimed_by IS NULL) = (claimed_at IS NULL));
+
 CREATE INDEX IF NOT EXISTS queued_queries_unclaimed
     ON queued_queries (created_at)
     WHERE claimed_by IS NULL;
