@@ -1,0 +1,76 @@
+-- Distributed multi-replica coordination: config revision tracking,
+-- global capacity leases, and single-owner queue claims.
+
+-- ---------------------------------------------------------------------------
+-- Config revision — singleton counter tracking the global config revision.
+-- Every admin write that mutates persisted config bumps this value so that
+-- other QueryFlux replicas can detect the change via polling or LISTEN/NOTIFY.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS config_revision (
+    id       BOOLEAN     PRIMARY KEY DEFAULT TRUE CHECK (id),
+    revision BIGINT      NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO config_revision (id, revision) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
+
+-- Trigger function: after the revision row is updated, emit a NOTIFY on the
+-- 'config_revision_changed' channel with the new revision as payload.
+CREATE OR REPLACE FUNCTION notify_config_revision_changed()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('config_revision_changed', NEW.revision::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER config_revision_notify
+    AFTER UPDATE ON config_revision
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_config_revision_changed();
+
+-- ---------------------------------------------------------------------------
+-- Capacity leases — each row represents a running query holding a capacity
+-- slot. Used by CapacityStore to enforce global max_running_queries across
+-- replicas. Replicas renew heartbeat_at for their leases on a timer; leases
+-- whose owner stops heartbeating are expired.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS cluster_capacity_leases (
+    query_id      TEXT        PRIMARY KEY,
+    cluster_name  TEXT        NOT NULL,
+    instance_id   TEXT        NOT NULL,
+    acquired_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    heartbeat_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX cluster_capacity_leases_cluster
+    ON cluster_capacity_leases (cluster_name);
+
+CREATE INDEX cluster_capacity_leases_heartbeat
+    ON cluster_capacity_leases (heartbeat_at);
+
+-- CapacityStore::heartbeat renews every lease held by one replica
+-- (UPDATE ... WHERE instance_id = $1) on a 60s timer.
+CREATE INDEX cluster_capacity_leases_instance
+    ON cluster_capacity_leases (instance_id);
+
+-- ---------------------------------------------------------------------------
+-- Queue claims — claim columns on queued_queries so only one replica
+-- processes a given queued query.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE queued_queries
+    ADD COLUMN IF NOT EXISTS claimed_by TEXT,
+    ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS queued_queries_unclaimed
+    ON queued_queries (created_at)
+    WHERE claimed_by IS NULL;
+
+-- QueueCoordinator::try_claim / list_unclaimed treat claims older than a
+-- cutoff as abandoned (claimed_at < $n); index only the claimed rows.
+CREATE INDEX IF NOT EXISTS queued_queries_claimed_at
+    ON queued_queries (claimed_at)
+    WHERE claimed_by IS NOT NULL;

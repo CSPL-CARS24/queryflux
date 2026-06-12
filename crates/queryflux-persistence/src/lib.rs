@@ -365,7 +365,14 @@ pub trait SweepCoordinator: Send + Sync {
 }
 
 /// Ownership handle for a sweep; call [`Self::release`] when the sweep ends.
-/// Implementations must also release on drop as a fallback for early exits.
+///
+/// Callers should treat `release` as the primary path and drop-without-release
+/// as best-effort only — `Drop` is synchronous, so implementations cannot run
+/// the async release there. Each backend needs its own drop story: the
+/// Postgres guard spawns the unlock onto the current runtime when one exists
+/// and otherwise relies on the session lock dying with its connection; a
+/// Redis-style guard would lean on a TTL'd lock key expiring. Whatever the
+/// mechanism, an unreleased guard must not hold the sweep forever.
 #[async_trait]
 pub trait SweepGuard: Send {
     async fn release(self: Box<Self>);

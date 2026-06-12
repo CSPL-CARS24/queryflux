@@ -259,20 +259,11 @@ async fn main() -> Result<()> {
 
         // Apply persisted security overrides (`security_settings` / `security_config` key).
         if let Ok(Some(v)) = pg.get_proxy_setting("security_config").await {
-            if let Ok(auth_cfg) = serde_json::from_value::<queryflux_core::config::AuthConfig>(
-                v.get("authConfig")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            ) {
+            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
+            if let Some(auth_cfg) = auth_cfg {
                 config.auth = auth_cfg;
             }
-            if let Ok(authz_cfg) =
-                serde_json::from_value::<queryflux_core::config::AuthorizationConfig>(
-                    v.get("authorizationConfig")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-            {
+            if let Some(authz_cfg) = authz_cfg {
                 config.authorization = authz_cfg;
             }
         }
@@ -742,12 +733,33 @@ async fn main() -> Result<()> {
     });
     tracing::info!(instance_id = %instance_id, "Replica instance ID");
 
-    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = backend
-        .clone()
-        .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>);
-    let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = backend
-        .clone()
-        .map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>);
+    // Distributed mode detection and validation. Resolved before AppState is
+    // built so the flag actually gates coordination: with `distributed: false`
+    // no capacity leases are taken, no queue claims are made, and the
+    // heartbeat/expiry/reconcile tasks (all keyed on `capacity_store`) stay off.
+    let distributed = config
+        .queryflux
+        .resolve_distributed(
+            backend
+                .as_ref()
+                .is_some_and(|b| b.supports_distributed_coordination()),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
+        .then(|| {
+            backend
+                .clone()
+                .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>)
+        })
+        .flatten();
+    let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = distributed
+        .then(|| {
+            backend
+                .clone()
+                .map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>)
+        })
+        .flatten();
 
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
@@ -835,15 +847,6 @@ async fn main() -> Result<()> {
         "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
     );
 
-    // Distributed mode detection and validation.
-    let distributed = config
-        .queryflux
-        .resolve_distributed(
-            backend
-                .as_ref()
-                .is_some_and(|b| b.supports_distributed_coordination()),
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
     if distributed {
         if config
             .queryflux
@@ -1101,7 +1104,18 @@ async fn main() -> Result<()> {
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
             ) {
                 let mut cache_guard = cache.lock().await;
-                match reload_live_config(backend, &mut cache_guard).await {
+                // Snapshot the pieces a reload must never silently weaken; the
+                // read guard is dropped before the write below.
+                let prev = {
+                    let l = live.read().await;
+                    PreservedLive {
+                        auth_provider: l.auth_provider.clone(),
+                        authorization: l.authorization.clone(),
+                        guard_chain: l.guard_chain.clone(),
+                        group_guard_chains: l.group_guard_chains.clone(),
+                    }
+                };
+                match reload_live_config(backend, &mut cache_guard, &prev).await {
                     Ok(new_live) => {
                         *live.write().await = new_live;
                         tracing::info!("Live config reloaded from backend");
@@ -1152,10 +1166,22 @@ async fn main() -> Result<()> {
             let mut revision_rx = revision_rx;
 
             // A future that resolves when the revision receiver gets a message,
-            // or pends forever if there is no receiver.
+            // or pends forever if there is no receiver. A closed channel (the
+            // LISTEN/NOTIFY task died) drops the receiver so we don't spin on
+            // an immediately-ready `recv()`; periodic polling remains the
+            // safety net for config propagation.
             async fn recv_revision(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) -> u64 {
                 match rx {
-                    Some(rx) => rx.recv().await.unwrap_or(0),
+                    Some(r) => match r.recv().await {
+                        Some(rev) => rev,
+                        None => {
+                            tracing::warn!(
+                                "Config revision channel closed — falling back to periodic polling"
+                            );
+                            *rx = None;
+                            std::future::pending().await
+                        }
+                    },
                     None => std::future::pending().await,
                 }
             }
@@ -1742,9 +1768,21 @@ async fn build_live_config(
 /// Existing adapter instances are reused for clusters that haven't changed.
 ///
 /// Cluster records are passed directly to `build_live_config` — no `to_core()` conversion.
+/// Hot pieces carried over from the previous `LiveConfig` when their backing
+/// rows are absent from the backend (never configured via admin) or fail to
+/// parse. A reload must never revert auth to permissive defaults or drop
+/// YAML-configured guard chains just because no row was ever written.
+struct PreservedLive {
+    auth_provider: Arc<dyn queryflux_auth::AuthProvider>,
+    authorization: Arc<dyn queryflux_auth::AuthorizationChecker>,
+    guard_chain: Option<Arc<GuardChain>>,
+    group_guard_chains: HashMap<String, Arc<GuardChain>>,
+}
+
 async fn reload_live_config(
     pg: &Arc<dyn BackendStore>,
     cache: &mut AdapterReloadCache,
+    prev: &PreservedLive,
 ) -> Result<LiveConfig> {
     let cluster_records = pg
         .list_cluster_configs()
@@ -1814,39 +1852,106 @@ async fn reload_live_config(
     )
     .await?;
 
-    // Load guardrails from DB (UI-managed). Overrides any YAML-configured guard chains.
-    if let Ok(Some(v)) = pg.get_proxy_setting("guardrails_config").await {
-        let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
-        live.guard_chain = global;
-        live.group_guard_chains = groups;
+    // Carry forward the pieces build_live_config seeds with placeholders. The
+    // DB reads below only *override* these on success — a missing row or a
+    // parse failure keeps the previous (startup-YAML or last-good) values.
+    live.auth_provider = prev.auth_provider.clone();
+    live.authorization = prev.authorization.clone();
+    live.guard_chain = prev.guard_chain.clone();
+    live.group_guard_chains = prev.group_guard_chains.clone();
+
+    // Guardrails from DB (UI-managed) override carried-over chains. An admin
+    // "clear" still writes an empty `global` row, so Ok(None) can only mean
+    // "never configured via admin" — keep the previous (e.g. YAML) chains.
+    match pg.get_proxy_setting("guardrails_config").await {
+        Ok(Some(v)) => {
+            let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
+            live.guard_chain = global;
+            live.group_guard_chains = groups;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("Reload: guardrails_config read failed; keeping previous chains: {e}")
+        }
     }
 
-    // Rebuild auth/authz from persisted security config.
-    // The cluster_groups loaded above are used for per-group authorization policies.
-    if let Ok(Some(v)) = pg.get_proxy_setting("security_config").await {
-        if let Ok(auth_cfg) = serde_json::from_value::<queryflux_core::config::AuthConfig>(
-            v.get("authConfig")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        ) {
-            match build_auth_provider(&auth_cfg) {
-                Ok(provider) => live.auth_provider = provider,
-                Err(e) => tracing::warn!("Reload: failed to rebuild auth provider: {e}"),
+    // Rebuild auth/authz from persisted security config. On a missing row or
+    // any parse/build failure keep the carried-over providers — a reload must
+    // never fall back to permissive defaults.
+    match pg.get_proxy_setting("security_config").await {
+        Ok(Some(v)) => {
+            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
+            match auth_cfg.map(|cfg| build_auth_provider(&cfg)) {
+                Some(Ok(provider)) => live.auth_provider = provider,
+                Some(Err(e)) => {
+                    tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
+                }
+                None => tracing::warn!(
+                    "Reload: security_config has no recognizable auth section; keeping previous"
+                ),
+            }
+            match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups)) {
+                Some(Ok(checker)) => live.authorization = checker,
+                Some(Err(e)) => {
+                    tracing::warn!("Reload: failed to rebuild authorization; keeping previous: {e}")
+                }
+                None => tracing::warn!(
+                    "Reload: security_config has no recognizable authorization section; keeping previous"
+                ),
             }
         }
-        if let Ok(authz_cfg) = serde_json::from_value::<queryflux_core::config::AuthorizationConfig>(
-            v.get("authorizationConfig")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        ) {
-            match build_authorization(&authz_cfg, &cluster_groups) {
-                Ok(checker) => live.authorization = checker,
-                Err(e) => tracing::warn!("Reload: failed to rebuild authorization: {e}"),
-            }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
         }
     }
 
     Ok(live)
+}
+
+/// Parse the persisted `security_config` proxy setting into typed configs.
+///
+/// `PUT /admin/config/security` stores the flat `UpsertSecurityConfig` shape
+/// (`auth_provider`, `auth_required`, `authorization_provider`, ...); earlier
+/// builds wrapped typed configs under `authConfig` / `authorizationConfig`.
+/// Accept both so existing rows keep working. Returns `None` for a section
+/// that is absent or fails to parse.
+fn parse_security_setting(
+    v: &serde_json::Value,
+) -> (
+    Option<queryflux_core::config::AuthConfig>,
+    Option<queryflux_core::config::AuthorizationConfig>,
+) {
+    use serde_json::{json, Value};
+
+    let auth = if let Some(wrapped) = v.get("authConfig") {
+        serde_json::from_value(wrapped.clone()).ok()
+    } else if v.get("auth_provider").is_some() {
+        serde_json::from_value(json!({
+            "provider": v.get("auth_provider").cloned().unwrap_or(Value::Null),
+            "required": v.get("auth_required").cloned().unwrap_or(Value::Bool(false)),
+            "oidc": v.get("oidc").cloned().unwrap_or(Value::Null),
+            "ldap": v.get("ldap").cloned().unwrap_or(Value::Null),
+            "staticUsers": v.get("static_users").cloned().unwrap_or(Value::Null),
+        }))
+        .ok()
+    } else {
+        None
+    };
+
+    let authz = if let Some(wrapped) = v.get("authorizationConfig") {
+        serde_json::from_value(wrapped.clone()).ok()
+    } else if v.get("authorization_provider").is_some() {
+        serde_json::from_value(json!({
+            "provider": v.get("authorization_provider").cloned().unwrap_or(Value::Null),
+            "openfga": v.get("openfga").cloned().unwrap_or(Value::Null),
+        }))
+        .ok()
+    } else {
+        None
+    };
+
+    (auth, authz)
 }
 
 fn build_auth_provider(
@@ -2201,4 +2306,62 @@ fn build_guard_chains_from_db_value(
         .unwrap_or_default();
 
     (global, groups)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_security_setting;
+    use queryflux_core::config::{AuthProviderConfig, AuthorizationProviderConfig};
+    use serde_json::json;
+
+    /// The shape `PUT /admin/config/security` actually persists
+    /// (flat `UpsertSecurityConfig` fields).
+    #[test]
+    fn parse_security_setting_flat_admin_shape() {
+        let v = json!({
+            "auth_provider": "static",
+            "auth_required": true,
+            "oidc": null,
+            "ldap": null,
+            "static_users": { "users": { "alice": { "password": "pw" } } },
+            "authorization_provider": "none",
+            "openfga": null,
+        });
+        let (auth, authz) = parse_security_setting(&v);
+        let auth = auth.expect("auth section should parse");
+        assert!(matches!(auth.provider, AuthProviderConfig::Static));
+        assert!(auth.required);
+        assert!(auth.static_users.is_some());
+        let authz = authz.expect("authz section should parse");
+        assert!(matches!(authz.provider, AuthorizationProviderConfig::None));
+    }
+
+    /// Legacy wrapped shape from earlier builds.
+    #[test]
+    fn parse_security_setting_wrapped_legacy_shape() {
+        let v = json!({
+            "authConfig": { "provider": "none", "required": true },
+            "authorizationConfig": { "provider": "openfga", "openfga": {
+                "url": "http://fga:8080", "storeId": "s1", "model": null
+            }},
+        });
+        let (auth, authz) = parse_security_setting(&v);
+        let auth = auth.expect("wrapped auth should parse");
+        assert!(matches!(auth.provider, AuthProviderConfig::None));
+        assert!(auth.required);
+        let authz = authz.expect("wrapped authz should parse");
+        assert!(matches!(
+            authz.provider,
+            AuthorizationProviderConfig::OpenFga
+        ));
+    }
+
+    /// Unrecognizable value: both sections None so the caller preserves
+    /// the previous providers instead of weakening to permissive defaults.
+    #[test]
+    fn parse_security_setting_unrecognized_yields_none() {
+        let (auth, authz) = parse_security_setting(&json!({ "something": "else" }));
+        assert!(auth.is_none());
+        assert!(authz.is_none());
+    }
 }

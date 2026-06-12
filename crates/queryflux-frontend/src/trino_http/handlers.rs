@@ -635,14 +635,27 @@ pub async fn get_queued_statement(
         {
             Ok(Some(_)) => {} // claimed successfully, proceed with dispatch
             Ok(None) => {
-                // Already claimed by another replica — tell client to keep polling.
-                let next_uri = format!(
-                    "{}/v1/statement/qf/queued/{}/{}",
-                    state.external_address,
-                    query_id.0,
-                    seq + 1
-                );
-                return json_response(queued_response(&query_id.0, seq, next_uri)).into_response();
+                // `None` means either claimed by another replica or the row no
+                // longer exists (finished/cleaned up). Distinguish them: a
+                // deleted query must 404 instead of polling "queued" forever.
+                match state.persistence.get_queued(&query_id).await {
+                    Ok(Some(_)) => {
+                        // Claimed by another replica — tell client to keep polling.
+                        let next_uri = format!(
+                            "{}/v1/statement/qf/queued/{}/{}",
+                            state.external_address,
+                            query_id.0,
+                            seq + 1
+                        );
+                        return json_response(queued_response(&query_id.0, seq, next_uri))
+                            .into_response();
+                    }
+                    Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                    Err(e) => {
+                        warn!("Persistence error checking claimed queued query: {e}");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
             }
             Err(e) => {
                 state.metrics.on_coordination_failure("queue_claim");
