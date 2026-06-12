@@ -40,7 +40,8 @@ use queryflux_metrics::{
 };
 use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
-    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore, KIND_GUARD,
+    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
+    DistributedBackendStore, KIND_GUARD,
 };
 use queryflux_routing::{
     chain::RouterChain,
@@ -142,6 +143,9 @@ async fn main() -> Result<()> {
     // needs to implement `BackendStore` and be constructed in the match above.
     // `None` in in-memory mode, which intentionally has no durable config source.
     let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
+    // Multi-replica coordination is optional: only backends that also implement
+    // `DistributedBackendStore` (Postgres today) are stored here.
+    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> = pg_store.map(|pg| pg as _);
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
@@ -740,7 +744,7 @@ async fn main() -> Result<()> {
     let distributed = config
         .queryflux
         .resolve_distributed(
-            backend
+            distributed_backend
                 .as_ref()
                 .is_some_and(|b| b.supports_distributed_coordination()),
         )
@@ -748,14 +752,14 @@ async fn main() -> Result<()> {
 
     let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
         .then(|| {
-            backend
+            distributed_backend
                 .clone()
                 .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>)
         })
         .flatten();
     let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = distributed
         .then(|| {
-            backend
+            distributed_backend
                 .clone()
                 .map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>)
         })
@@ -939,7 +943,7 @@ async fn main() -> Result<()> {
     // Also expires stale capacity leases from crashed replicas.
     tokio::spawn({
         let state = app_state.clone();
-        let backend = backend.clone();
+        let distributed_backend = distributed_backend.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
@@ -951,7 +955,7 @@ async fn main() -> Result<()> {
                 // holding the advisory lock runs them this cycle. A crashed owner's
                 // lock is released with its connection, so another replica takes
                 // over on its next tick. On lock errors, fail open and sweep anyway.
-                let sweep_lock = match &backend {
+                let sweep_lock = match &distributed_backend {
                     Some(backend) => match backend.try_sweep_lock("zombie-eviction").await {
                         Ok(Some(lock)) => Some(lock),
                         Ok(None) => continue, // another replica owns this cycle

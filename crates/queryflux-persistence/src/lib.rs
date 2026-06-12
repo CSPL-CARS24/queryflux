@@ -429,32 +429,55 @@ impl<
 }
 
 // ---------------------------------------------------------------------------
-// BackendStore — full contract for a complete persistence backend
+// BackendStore — durable persistence contract (single- or multi-replica)
 // ---------------------------------------------------------------------------
 
-/// The complete interface a persistence backend must satisfy to replace Postgres
-/// (e.g. a future Redis-backed store).
+/// The interface a persistence backend must satisfy to replace Postgres for
+/// query state, metrics, and the admin API (e.g. a future Redis-backed store).
 ///
-/// Covers all responsibilities:
-/// - `Persistence`           — in-flight query state (executing + queued)
-/// - `MetricsStore`          — writing completed query records and cluster snapshots
-/// - `AdminStore`            — admin API surface (history analytics, cluster/group
+/// Covers the core responsibilities:
+/// - `Persistence`  — in-flight query state (executing + queued)
+/// - `MetricsStore` — writing completed query records and cluster snapshots
+/// - `AdminStore`   — admin API surface (history analytics, cluster/group
 ///   config CRUD, script library, proxy settings, routing, config revisions)
-/// - `CapacityStore`         — global cluster capacity coordination
-/// - `QueueCoordinator`      — single-owner queued query claiming
-/// - `SweepCoordinator`      — single-owner background sweeps
-/// - `BackendCapabilities`   — startup wiring decisions (distributed mode)
 ///
 /// `AdminStore` is a supertrait (rather than its components) so that an
 /// `Arc<dyn BackendStore>` upcasts to every narrower trait object the wiring
 /// hands out (`Arc<dyn AdminStore>`, `Arc<dyn ProxySettingsStore>`, ...).
 ///
-/// The blanket impl below means you only need to implement the component traits
-/// and you automatically satisfy `BackendStore` — no extra code required.
-pub trait BackendStore:
-    Persistence
-    + MetricsStore
-    + AdminStore
+/// Multi-replica coordination (`CapacityStore`, `QueueCoordinator`,
+/// `SweepCoordinator`, `BackendCapabilities`) lives on
+/// [`DistributedBackendStore`]. Backends that only serve a single instance, or
+/// that delegate coordination elsewhere, implement `BackendStore` alone.
+///
+/// **Migration:** if your backend previously implemented the distributed traits
+/// only because `BackendStore` required them, drop those impls and keep
+/// `BackendStore`. To power distributed mode, additionally implement the four
+/// coordination traits (or their in-memory no-op variants for testing); the
+/// blanket impl on [`DistributedBackendStore`] picks them up automatically.
+/// Startup code type-erases distributed backends as
+/// `Option<Arc<dyn DistributedBackendStore>>` separately from `BackendStore`.
+pub trait BackendStore: Persistence + MetricsStore + AdminStore + Send + Sync {}
+
+impl<T: Persistence + MetricsStore + AdminStore + Send + Sync> BackendStore for T {}
+
+// ---------------------------------------------------------------------------
+// DistributedBackendStore — multi-replica coordination (optional layer)
+// ---------------------------------------------------------------------------
+
+/// Extension of [`BackendStore`] for backends that can coordinate multiple
+/// QueryFlux replicas (global capacity leases, single-owner queue claims,
+/// sweep locks, and distributed-mode capability flags).
+///
+/// Wired only when present: startup holds `Option<Arc<dyn DistributedBackendStore>>`
+/// alongside `Option<Arc<dyn BackendStore>>`. Postgres satisfies both; a
+/// minimal custom backend can implement `BackendStore` alone and leave
+/// distributed mode disabled.
+///
+/// The blanket impl means you only implement the component traits — no extra
+/// `DistributedBackendStore` methods.
+pub trait DistributedBackendStore:
+    BackendStore
     + CapacityStore
     + QueueCoordinator
     + SweepCoordinator
@@ -465,15 +488,13 @@ pub trait BackendStore:
 }
 
 impl<
-        T: Persistence
-            + MetricsStore
-            + AdminStore
+        T: BackendStore
             + CapacityStore
             + QueueCoordinator
             + SweepCoordinator
             + BackendCapabilities
             + Send
             + Sync,
-    > BackendStore for T
+    > DistributedBackendStore for T
 {
 }

@@ -535,11 +535,11 @@ impl QueryFluxConfig {
 
     /// Resolve whether distributed mode is active and validate the configuration.
     ///
-    /// `backend_supports_coordination` is the persistence backend's
-    /// `BackendCapabilities::supports_distributed_coordination()` — `true` for
-    /// backends that can coordinate replicas (Postgres today), `false` for
-    /// InMemory. Distributed mode defaults to on whenever the backend supports
-    /// it; set `distributed: false` to opt out explicitly.
+    /// `backend_supports_coordination` is whether a `DistributedBackendStore`
+    /// is wired at startup and its `supports_distributed_coordination()` returns
+    /// `true` (Postgres today). Backends that only implement `BackendStore` pass
+    /// `false`. Distributed mode defaults to on whenever coordination is
+    /// available; set `distributed: false` to opt out explicitly.
     ///
     /// Returns `Err` when distributed mode is requested but the persistence
     /// backend cannot coordinate across replicas.
