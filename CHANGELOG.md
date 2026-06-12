@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.2.0...queryflux-v0.3.0) (2026-06-12)
+
+
+### Features
+
+* Add helm chart for QueryFlux ([#75](https://github.com/lakeops-org/queryflux/issues/75)) ([3c3acd4](https://github.com/lakeops-org/queryflux/commit/3c3acd4e8f5a3a4e9d46ad873ff8a88413c26d0a))
+* Add Python and webhook guardrail execution ([#81](https://github.com/lakeops-org/queryflux/issues/81)) ([0af87cd](https://github.com/lakeops-org/queryflux/commit/0af87cdb8f94e67da2408e8dec46728488c9b944))
+* group default tags, admin OpenAPI spec, and Studio Swagger UI ([#78](https://github.com/lakeops-org/queryflux/issues/78)) ([4a97a25](https://github.com/lakeops-org/queryflux/commit/4a97a254de880958479098290a907aa51a5ddb6b))
+
 ## [0.2.0](https://github.com/lakeops-org/queryflux/compare/queryflux-v0.1.2...queryflux-v0.2.0) (2026-06-02)
 
 
