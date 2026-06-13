@@ -514,9 +514,19 @@ pub struct QueryFluxConfig {
     /// is Postgres; set explicitly to `false` to opt out while still using Postgres persistence.
     #[serde(default)]
     pub distributed: Option<bool>,
+    /// Maximum seconds to wait for in-flight queries to drain during graceful shutdown.
+    /// After this timeout, the process exits regardless of remaining work.
+    /// Defaults to 30 seconds.
+    #[serde(default)]
+    pub shutdown_drain_timeout_secs: Option<u64>,
 }
 
 impl QueryFluxConfig {
+    /// Seconds to wait for in-flight queries to drain on shutdown. Defaults to 30.
+    pub fn shutdown_drain_timeout_secs(&self) -> u64 {
+        self.shutdown_drain_timeout_secs.unwrap_or(30)
+    }
+
     /// Interval for **periodic** background reload of routing rules and cluster/group config from Postgres.
     ///
     /// - [`None`](Option::None) (field omitted in YAML) → **Some(30)**.
@@ -702,6 +712,12 @@ pub struct AdminApiConfig {
     /// Ignored once the password has been changed via the web UI (DB hash takes precedence).
     #[serde(default = "default_admin_password")]
     pub password: String,
+    /// Allowed CORS origins for the admin API. When set, only these origins may
+    /// make cross-origin requests. When empty or omitted, all origins are allowed
+    /// (a startup warning is logged because `allow_origin(Any)` on the admin API
+    /// is a security risk in production).
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 fn default_admin_port() -> u16 {
@@ -722,6 +738,7 @@ impl Default for AdminApiConfig {
             port: 9000,
             username: default_admin_username(),
             password: default_admin_password(),
+            cors_allowed_origins: Vec::new(),
         }
     }
 }

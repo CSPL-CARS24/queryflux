@@ -31,7 +31,15 @@ use crate::{
 pub struct InMemoryPersistence {
     // --- in-flight state ---
     /// Keyed by BackendQueryId (Trino's query ID) — matches the client poll URL.
+    ///
+    /// Intentionally unbounded: entries represent active in-flight queries and are
+    /// removed as soon as they complete or are cancelled. A hard cap would cause
+    /// legitimate queries to be silently dropped. The `max_running_queries` enforced
+    /// by `ClusterState` / `CapacityStore` is the upstream guard on entry count.
+    /// Production deployments should use the Postgres backend.
     executing: DashMap<String, ExecutingQuery>,
+    /// See note on `executing` above. Entry count is bounded by `max_queued_queries`
+    /// enforced at enqueue time; stale entries are swept by `delete_queued_not_accessed_since`.
     queued: DashMap<String, QueuedQuery>,
 
     // --- query history (write side) ---
@@ -172,6 +180,13 @@ impl Persistence for InMemoryPersistence {
     }
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>> {
         Ok(self.queued.iter().map(|e| e.value().clone()).collect())
+    }
+
+    async fn touch_queued_last_accessed(&self, id: &ProxyQueryId) -> Result<()> {
+        if let Some(mut entry) = self.queued.get_mut(&id.0) {
+            entry.last_accessed = Utc::now();
+        }
+        Ok(())
     }
 
     async fn delete_queued_not_accessed_since(&self, cutoff: DateTime<Utc>) -> Result<u64> {
@@ -815,6 +830,11 @@ impl CapacityStore for InMemoryPersistence {
 
     async fn active_count(&self, _cluster_name: &str) -> Result<u64> {
         // In-memory mode: local ClusterState is the source of truth.
+        Ok(0)
+    }
+
+    async fn release_all_for_instance(&self, _instance_id: &str) -> Result<u64> {
+        // Single instance — nothing to release.
         Ok(0)
     }
 }

@@ -82,6 +82,10 @@ pub struct AppState {
     pub queue_coordinator: Option<Arc<dyn QueueCoordinator>>,
     /// Unique identifier for this replica instance, used for capacity leases and queue claims.
     pub instance_id: String,
+    /// Shared HTTP client for backend-facing fire-and-forget calls (e.g. cancel forwarding).
+    /// Pre-configured with a 30-second timeout; reusing the client avoids per-request
+    /// connection-pool churn.
+    pub http_client: reqwest::Client,
 }
 
 /// Stable per-query metadata that does not change across the query's lifecycle.

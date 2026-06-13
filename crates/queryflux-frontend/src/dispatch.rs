@@ -245,10 +245,17 @@ pub async fn dispatch_query(
     state.metrics.on_query_started(&group.0, &cluster_name.0);
 
     let this_cluster_cfg = cluster_cfg.get(&cluster_name.0).cloned();
-    let credentials = state
+    let credentials = match state
         .identity_resolver
         .resolve(auth_ctx, this_cluster_cfg.as_ref())
-        .await;
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            slot.release().await;
+            return Err(e);
+        }
+    };
 
     let adapter_kind = match state.adapter(&cluster_name.0).await {
         Some(a) => a,
@@ -374,16 +381,19 @@ pub async fn dispatch_query(
     }
 
     // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
+    // Treat serialization failure as fatal — silently omitting guard actions from the
+    // audit record would produce incomplete compliance logs.
     let submitted_guard_actions: Vec<serde_json::Value> = all_guard_actions
         .iter()
-        .filter_map(|a| match serde_json::to_value(a) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                warn!(guard = %a.guard, "Failed to serialize guard action — omitted from audit record: {e}");
-                None
-            }
+        .map(|a| {
+            serde_json::to_value(a).map_err(|e| {
+                QueryFluxError::Engine(format!(
+                    "Failed to serialize guard action '{}': {e}",
+                    a.guard
+                ))
+            })
         })
-        .collect();
+        .collect::<queryflux_core::error::Result<Vec<_>>>()?;
 
     match adapter_kind {
         AdapterKind::Async(adapter) => {
@@ -827,6 +837,14 @@ impl ClusterSlotGuard {
 impl Drop for ClusterSlotGuard {
     fn drop(&mut self) {
         if !self.released {
+            // Fallback path: the guard was dropped without an explicit `release()` call
+            // (e.g. a future was cancelled mid-dispatch). We spawn a best-effort task to
+            // clean up the slot.
+            //
+            // Bounding note: this path is only reached on unclean drops (panics, task
+            // cancellations). The upstream `max_running_queries` gate constrains how many
+            // guards can be alive simultaneously, so the total number of concurrent
+            // best-effort tasks is bounded by the per-cluster concurrency limit.
             let mgr = self.cluster_manager.clone();
             let group = self.group.clone();
             let cluster = self.cluster.clone();
@@ -1121,10 +1139,17 @@ async fn setup_sync_query(
     let was_translated = translated != sql;
 
     let this_cluster_cfg = cluster_configs.get(&cluster_name.0).cloned();
-    let credentials = state
+    let credentials = match state
         .identity_resolver
         .resolve(auth_ctx, this_cluster_cfg.as_ref())
-        .await;
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            slot.release().await;
+            return Err(e);
+        }
+    };
 
     // Fallback interpolation: when the adapter does not support native params,
     // substitute `?` placeholders with typed literals now so the adapter receives

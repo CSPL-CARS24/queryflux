@@ -8,7 +8,7 @@ use queryflux_core::error::{QueryFluxError, Result};
 use tracing::info;
 
 use crate::state::AppState;
-use crate::FrontendListenerTrait;
+use crate::{FrontendListenerTrait, ShutdownRx};
 
 /// Snowflake SQL API v2 frontend (`/api/v2/statements`).
 ///
@@ -33,7 +33,7 @@ impl SnowflakeFrontend {
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for SnowflakeFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.port)
             .parse()
             .map_err(|e: std::net::AddrParseError| QueryFluxError::Other(e.into()))?;
@@ -46,6 +46,9 @@ impl FrontendListenerTrait for SnowflakeFrontend {
                 .map_err(|e| QueryFluxError::Other(e.into()))?,
             self.router(),
         )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
         .await
         .map_err(|e| QueryFluxError::Other(e.into()))
     }

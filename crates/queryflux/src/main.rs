@@ -621,6 +621,25 @@ async fn main() -> Result<()> {
         build_guard_chains(&config, &guard_script_bodies)
     };
 
+    // --- Startup validation: referential integrity of routing → groups → adapters ---
+    {
+        let issues = validate_live_config_refs(
+            &config.routers,
+            &config.routing_fallback,
+            &group_members,
+            &adapters,
+        );
+        if !issues.is_empty() {
+            for issue in &issues {
+                tracing::error!("Config validation: {issue}");
+            }
+            anyhow::bail!(
+                "Startup config has {} referential integrity error(s) — aborting",
+                issues.len()
+            );
+        }
+    }
+
     // --- Wrap hot-reloadable fields in LiveConfig ---
     let group_default_tags: HashMap<String, queryflux_core::tags::QueryTags> = config
         .cluster_groups
@@ -741,6 +760,7 @@ async fn main() -> Result<()> {
         })
         .flatten();
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
         live: live.clone(),
@@ -751,6 +771,10 @@ async fn main() -> Result<()> {
         capacity_store,
         queue_coordinator,
         instance_id,
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build shared http client"),
     });
 
     // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---
@@ -804,6 +828,13 @@ async fn main() -> Result<()> {
     });
 
     let admin_store_for_reload = admin_store.clone();
+    let cors_origins = config.queryflux.admin_api.cors_allowed_origins.clone();
+    if cors_origins.is_empty() {
+        tracing::warn!(
+            "Admin API CORS allows any origin (corsAllowedOrigins is empty). \
+             Set queryflux.adminApi.corsAllowedOrigins to restrict cross-origin access in production."
+        );
+    }
     let admin = AdminFrontend::new(
         prometheus.clone(),
         live.clone(),
@@ -816,6 +847,7 @@ async fn main() -> Result<()> {
         frontends_status,
         admin_creds,
         test_cluster_fn,
+        cors_origins,
     );
 
     // --- Start Trino HTTP frontend ---
@@ -1343,60 +1375,176 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Run all enabled frontends concurrently; any one exiting stops the process.
-    let mysql_future = async {
-        match &config.queryflux.frontends.mysql_wire {
-            Some(cfg) if cfg.enabled => {
-                MysqlWireFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    // Spawn all enabled frontends as tasks. Each frontend observes `shutdown_rx`
+    // internally: axum-based frontends use `with_graceful_shutdown` (stop accepting,
+    // finish in-flight requests), wire-based frontends break their accept loop, and
+    // tonic (Flight SQL) uses `serve_with_shutdown`.
+    let mut trino_handle = tokio::spawn({
+        let fe = frontend;
+        let rx = shutdown_rx.clone();
+        async move { fe.listen(rx).await }
+    });
+    let mut admin_handle = tokio::spawn({
+        let rx = shutdown_rx.clone();
+        async move { admin.listen(rx).await }
+    });
+    let mut mysql_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.mysql_wire.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => MysqlWireFrontend::new(state, c.port).listen(rx).await,
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
         }
-    };
-
-    let postgres_future = async {
-        match &config.queryflux.frontends.postgres_wire {
-            Some(cfg) if cfg.enabled => {
-                PostgresWireFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    });
+    let mut postgres_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.postgres_wire.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => PostgresWireFrontend::new(state, c.port).listen(rx).await,
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
         }
-    };
-
-    let flight_sql_future = async {
-        match &config.queryflux.frontends.flight_sql {
-            Some(cfg) if cfg.enabled => {
-                FlightSqlFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    });
+    let mut flight_sql_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.flight_sql.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => FlightSqlFrontend::new(state, c.port).listen(rx).await,
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
         }
-    };
-
-    let snowflake_future = async {
-        match &config.queryflux.frontends.snowflake_http {
-            Some(cfg) if cfg.enabled => {
-                SnowflakeFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    });
+    let mut snowflake_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.snowflake_http.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => SnowflakeFrontend::new(state, c.port).listen(rx).await,
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+        }
+    });
+
+    // Wait for either a shutdown signal or an unexpected frontend exit.
+    let shutdown_signal = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("Received SIGINT — initiating graceful shutdown"),
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM — initiating graceful shutdown"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            tracing::info!("Received Ctrl-C — initiating graceful shutdown");
         }
     };
 
     tokio::select! {
-        r = frontend.listen()   => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = admin.listen()      => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = mysql_future        => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = postgres_future     => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = flight_sql_future   => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = snowflake_future    => r.map_err(|e| anyhow::anyhow!("{e}"))?,
+        _ = shutdown_signal => {},
+        r = &mut trino_handle   => { if let Ok(Err(e)) = r { tracing::error!("Trino HTTP exited unexpectedly: {e}"); } },
+        r = &mut admin_handle   => { if let Ok(Err(e)) = r { tracing::error!("Admin exited unexpectedly: {e}"); } },
+        r = &mut mysql_handle   => { if let Ok(Err(e)) = r { tracing::error!("MySQL wire exited unexpectedly: {e}"); } },
+        r = &mut postgres_handle => { if let Ok(Err(e)) = r { tracing::error!("Postgres wire exited unexpectedly: {e}"); } },
+        r = &mut flight_sql_handle => { if let Ok(Err(e)) = r { tracing::error!("Flight SQL exited unexpectedly: {e}"); } },
+        r = &mut snowflake_handle => { if let Ok(Err(e)) = r { tracing::error!("Snowflake exited unexpectedly: {e}"); } },
     }
 
+    // --- Phase 1: signal all frontends to stop accepting new connections ---
+    let _ = shutdown_tx.send(true);
+
+    // --- Phase 2: drain in-flight requests ---
+    let drain_timeout_secs = config.queryflux.shutdown_drain_timeout_secs();
+    let drain_timeout = std::time::Duration::from_secs(drain_timeout_secs);
+    tracing::info!("Draining in-flight requests (timeout: {drain_timeout_secs}s)...");
+
+    let drain_future = async {
+        // Wait for all frontends to finish processing in-flight requests.
+        // Axum frontends complete when all connections are done; wire frontends
+        // return immediately from their accept loop but spawned connection tasks
+        // continue running.
+        let _ = tokio::join!(
+            trino_handle,
+            admin_handle,
+            mysql_handle,
+            postgres_handle,
+            flight_sql_handle,
+            snowflake_handle,
+        );
+
+        // Poll persistence until no executing or queued queries remain (or until
+        // the outer timeout fires). This covers spawned wire-protocol connection
+        // handlers that are still mid-query after the accept loop exited.
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            let executing = app_state
+                .persistence
+                .list_all()
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let queued = app_state
+                .persistence
+                .list_queued()
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if executing == 0 && queued == 0 {
+                tracing::info!("All in-flight queries drained");
+                break;
+            }
+            tracing::info!(executing, queued, "Waiting for queries to drain...");
+        }
+    };
+
+    if tokio::time::timeout(drain_timeout, drain_future)
+        .await
+        .is_err()
+    {
+        let executing = app_state
+            .persistence
+            .list_all()
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let queued = app_state
+            .persistence
+            .list_queued()
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+        tracing::warn!(
+            executing,
+            queued,
+            "Drain timeout reached after {drain_timeout_secs}s — forcing shutdown"
+        );
+    }
+
+    // --- Phase 3: release capacity leases owned by this replica ---
+    tracing::info!("Releasing capacity leases for this replica...");
+    if let Some(cap) = &app_state.capacity_store {
+        if let Err(e) = cap.release_all_for_instance(&app_state.instance_id).await {
+            tracing::warn!("Failed to release capacity leases on shutdown: {e}");
+        } else {
+            tracing::info!("Capacity leases released");
+        }
+    }
+
+    tracing::info!("QueryFlux shutdown complete");
     Ok(())
 }
 

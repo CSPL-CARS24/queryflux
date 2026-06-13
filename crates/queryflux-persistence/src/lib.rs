@@ -54,6 +54,10 @@ pub trait Persistence: Send + Sync {
     async fn delete_queued(&self, id: &ProxyQueryId) -> Result<()>;
     async fn list_queued(&self) -> Result<Vec<QueuedQuery>>;
 
+    /// Bump `last_accessed` to now for a queued query, keeping it alive in the
+    /// fairness gate's activity window. Must be called on every client poll.
+    async fn touch_queued_last_accessed(&self, id: &ProxyQueryId) -> Result<()>;
+
     /// Delete all queued queries whose `last_accessed` is older than `cutoff`.
     async fn delete_queued_not_accessed_since(&self, cutoff: DateTime<Utc>) -> Result<u64>;
 
@@ -324,6 +328,11 @@ pub trait CapacityStore: Send + Sync {
 
     /// Current number of active (non-expired) slots for a cluster.
     async fn active_count(&self, cluster_name: &str) -> Result<u64>;
+
+    /// Release all capacity leases held by `instance_id`. Called during graceful
+    /// shutdown so the departing replica's slots are immediately available to
+    /// other replicas instead of waiting for the stale-lease expiry sweep.
+    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64>;
 }
 
 // ---------------------------------------------------------------------------

@@ -302,6 +302,10 @@ impl TestHarness {
             capacity_store: None,
             queue_coordinator: None,
             instance_id: "test-harness".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build shared http client"),
         });
 
         let trino_fe = TrinoHttpFrontend::new(state.clone(), port);

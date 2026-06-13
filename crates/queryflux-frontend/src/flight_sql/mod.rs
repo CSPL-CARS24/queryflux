@@ -43,7 +43,7 @@ use queryflux_core::{
 
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::FrontendListenerTrait;
+use crate::{FrontendListenerTrait, ShutdownRx};
 
 // ── Frontend listener ─────────────────────────────────────────────────────────
 
@@ -60,7 +60,7 @@ impl FlightSqlFrontend {
 
 #[async_trait]
 impl FrontendListenerTrait for FlightSqlFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.port)
             .parse()
             .map_err(|e: std::net::AddrParseError| QueryFluxError::Other(e.into()))?;
@@ -72,7 +72,9 @@ impl FrontendListenerTrait for FlightSqlFrontend {
 
         tonic::transport::Server::builder()
             .add_service(flight_server)
-            .serve(addr)
+            .serve_with_shutdown(addr, async move {
+                let _ = shutdown.changed().await;
+            })
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))
     }

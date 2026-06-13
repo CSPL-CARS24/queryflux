@@ -1360,6 +1360,15 @@ impl Persistence for PostgresStore {
             .collect()
     }
 
+    async fn touch_queued_last_accessed(&self, id: &ProxyQueryId) -> Result<()> {
+        sqlx::query("UPDATE queued_queries SET last_accessed = now() WHERE id = $1")
+            .bind(&id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("touch_queued_last_accessed: {e}")))?;
+        Ok(())
+    }
+
     async fn delete_queued_not_accessed_since(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
@@ -1711,6 +1720,12 @@ impl CapacityStore for PostgresStore {
     }
 
     async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        // Known non-atomicity: DELETE + reconcile UPDATE are two separate statements.
+        // A new acquire can commit its lease row between them, causing the counter to
+        // be written one lower than the true lease count. Under-admission is the safe
+        // direction (one query slot is wasted, not over-allocated), and the next sweep
+        // cycle (~120 s) corrects any drift. We accept this over a heavier serializable
+        // transaction because the sweep runs infrequently and correctness is recovered.
         let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE heartbeat_at < $1")
             .bind(cutoff)
             .execute(&self.pool)
@@ -1768,6 +1783,32 @@ impl CapacityStore for PostgresStore {
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("active_count: {e}")))?;
         Ok(count.max(0) as u64)
+    }
+
+    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            WITH del AS (
+                DELETE FROM cluster_capacity_leases
+                WHERE instance_id = $1
+                RETURNING cluster_name
+            ),
+            counts AS (
+                SELECT cluster_name, COUNT(*) AS cnt
+                FROM del
+                GROUP BY cluster_name
+            )
+            UPDATE cluster_capacity_counters c
+            SET running = GREATEST(c.running - counts.cnt, 0)
+            FROM counts
+            WHERE c.cluster_name = counts.cluster_name
+            "#,
+        )
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
+        Ok(result.rows_affected())
     }
 }
 

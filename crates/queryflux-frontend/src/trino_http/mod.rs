@@ -11,7 +11,7 @@ use axum::{
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::FrontendListenerTrait;
+use crate::{FrontendListenerTrait, ShutdownRx};
 use handlers::*;
 use queryflux_core::error::Result;
 use state::AppState;
@@ -47,13 +47,16 @@ impl TrinoHttpFrontend {
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for TrinoHttpFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!("Trino HTTP frontend listening on {addr}");
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Other(e.into()))?;
         axum::serve(listener, self.router())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Other(e.into()))?;
         Ok(())

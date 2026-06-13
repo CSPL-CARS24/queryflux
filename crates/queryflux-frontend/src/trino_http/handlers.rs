@@ -586,7 +586,15 @@ fn base64_decode(encoded: &str) -> Result<String, ()> {
 pub async fn get_queued_statement(
     State(state): State<Arc<AppState>>,
     Path((id, seq)): Path<(String, u64)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let creds = extract_credentials(&headers);
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    if let Err(e) = auth_provider.authenticate(&creds).await {
+        warn!("Queued poll auth failed: {e}");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let query_id = ProxyQueryId(id);
 
     // In distributed mode, try to claim ownership of this queued query so only
@@ -643,6 +651,14 @@ pub async fn get_queued_statement(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    if let Err(e) = state
+        .persistence
+        .touch_queued_last_accessed(&query_id)
+        .await
+    {
+        warn!(id = %query_id, "Failed to refresh queued last_accessed: {e}");
+    }
 
     queued_backoff_delay(seq).await;
 
@@ -760,6 +776,14 @@ pub async fn get_executing_statement(
     Path(trino_path): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Authenticate the polling request when auth is enabled.
+    let creds = extract_credentials(&headers);
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    if let Err(e) = auth_provider.authenticate(&creds).await {
+        warn!("Poll auth failed: {e}");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     // trino_path = e.g. "queued/20260319_084733_00386_kqwci/1/token"
     //                 or "executing/20260319_084733_00386_kqwci/1/token"
     // Extract the Trino query ID (always the second segment).
@@ -1025,7 +1049,15 @@ pub async fn get_executing_statement(
 pub async fn delete_executing_statement(
     State(state): State<Arc<AppState>>,
     Path(trino_path): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let creds = extract_credentials(&headers);
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    if let Err(e) = auth_provider.authenticate(&creds).await {
+        warn!("Cancel auth failed: {e}");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let trino_id = match trino_path.split('/').nth(1) {
         Some(id) => id.to_string(),
         None => return StatusCode::NO_CONTENT.into_response(),
@@ -1042,8 +1074,7 @@ pub async fn delete_executing_statement(
                 .trim_end_matches('/'),
             trino_path
         );
-        let client = reqwest::Client::new();
-        let _ = client.delete(&trino_url).send().await;
+        let _ = state.http_client.delete(&trino_url).send().await;
 
         state
             .release_query_slot(

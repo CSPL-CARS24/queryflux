@@ -42,7 +42,7 @@ use utoipa::{OpenApi, ToSchema};
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{state::LiveConfig, FrontendListenerTrait};
+use crate::{state::LiveConfig, FrontendListenerTrait, ShutdownRx};
 
 /// Callback type for testing a cluster config without persisting it.
 /// Receives `(engine_key, config_json)` → returns `Ok(true)` if healthy, `Ok(false)` if
@@ -494,6 +494,7 @@ pub struct AdminFrontend {
     frontends_status: FrontendsStatusDto,
     admin_creds: Arc<AdminCredentialsManager>,
     test_cluster_fn: TestClusterFn,
+    cors_allowed_origins: Vec<String>,
 }
 
 impl AdminFrontend {
@@ -510,6 +511,7 @@ impl AdminFrontend {
         frontends_status: FrontendsStatusDto,
         admin_creds: Arc<AdminCredentialsManager>,
         test_cluster_fn: TestClusterFn,
+        cors_allowed_origins: Vec<String>,
     ) -> Self {
         Self {
             prometheus,
@@ -523,6 +525,7 @@ impl AdminFrontend {
             frontends_status,
             admin_creds,
             test_cluster_fn,
+            cors_allowed_origins,
         }
     }
 
@@ -546,6 +549,7 @@ impl AdminFrontend {
         // Public routes — no authentication required.
         let public = Router::new()
             .route("/health", get(health_handler))
+            .route("/readyz", get(readiness_handler))
             .route("/metrics", get(metrics_handler))
             .route(
                 "/openapi.json",
@@ -631,29 +635,48 @@ impl AdminFrontend {
                 admin_auth_middleware,
             ));
 
+        let cors = if self.cors_allowed_origins.is_empty() {
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::PATCH,
+                    Method::PUT,
+                    Method::POST,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any)
+        } else {
+            let origins: Vec<axum::http::HeaderValue> = self
+                .cors_allowed_origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([
+                    Method::GET,
+                    Method::PATCH,
+                    Method::PUT,
+                    Method::POST,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any)
+        };
+
         Router::new()
             .merge(public)
             .merge(protected)
             .with_state(state)
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([
-                        Method::GET,
-                        Method::PATCH,
-                        Method::PUT,
-                        Method::POST,
-                        Method::DELETE,
-                        Method::OPTIONS,
-                    ])
-                    .allow_headers(Any),
-            )
+            .layer(cors)
     }
 }
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for AdminFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!(
             "Admin server listening on {addr}  — Prometheus: {addr}/metrics  Swagger UI: {addr}/docs"
@@ -662,6 +685,9 @@ impl FrontendListenerTrait for AdminFrontend {
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
         axum::serve(listener, self.router())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
         Ok(())
@@ -785,7 +811,7 @@ async fn change_password_handler(
 // Standard handlers
 // ---------------------------------------------------------------------------
 
-/// Liveness probe.
+/// Liveness probe — unconditionally returns 200 to indicate the process is alive.
 #[utoipa::path(
     get,
     path = "/health",
@@ -794,6 +820,32 @@ async fn change_password_handler(
 )]
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Readiness probe — returns 200 only when the proxy has at least one configured
+/// cluster group with a non-empty adapter set. Kubernetes should use this for the
+/// `readinessProbe` so traffic is not routed to a replica that hasn't finished
+/// loading its config (or whose last reload left it with zero adapters).
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Service is ready to accept traffic", body = str),
+        (status = 503, description = "Service is not yet ready", body = str),
+    )
+)]
+async fn readiness_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let live = state.live.read().await;
+    if live.adapters.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
+    }
+    let cm = live.cluster_manager.clone();
+    match cm.all_cluster_states().await {
+        Ok(states) if !states.is_empty() => (StatusCode::OK, "ready").into_response(),
+        Ok(_) => (StatusCode::SERVICE_UNAVAILABLE, "no cluster groups").into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "cluster manager error").into_response(),
+    }
 }
 
 /// Protocol frontends enabled at process start (from YAML). Not hot-reloaded.

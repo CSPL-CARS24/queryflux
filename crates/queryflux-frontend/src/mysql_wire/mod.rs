@@ -41,7 +41,7 @@ use queryflux_core::{
 
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::FrontendListenerTrait;
+use crate::{FrontendListenerTrait, ShutdownRx};
 
 // ── MySQL command bytes ───────────────────────────────────────────────────────
 
@@ -99,7 +99,7 @@ impl MysqlWireFrontend {
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for MysqlWireFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!("MySQL wire frontend listening on {addr}");
         let listener = TcpListener::bind(&addr)
@@ -107,19 +107,25 @@ impl FrontendListenerTrait for MysqlWireFrontend {
             .map_err(|e| QueryFluxError::Other(e.into()))?;
 
         loop {
-            let (stream, peer) = listener
-                .accept()
-                .await
-                .map_err(|e| QueryFluxError::Other(e.into()))?;
-            debug!(peer = %peer, "MySQL wire: new connection");
-            let state = self.state.clone();
-            let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, state, conn_id).await {
-                    debug!(conn_id, "MySQL wire connection closed: {e}");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer) = result.map_err(|e| QueryFluxError::Other(e.into()))?;
+                    debug!(peer = %peer, "MySQL wire: new connection");
+                    let state = self.state.clone();
+                    let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, state, conn_id).await {
+                            debug!(conn_id, "MySQL wire connection closed: {e}");
+                        }
+                    });
                 }
-            });
+                _ = shutdown.changed() => {
+                    info!("MySQL wire frontend: shutdown signal received, stopping accept loop");
+                    break;
+                }
+            }
         }
+        Ok(())
     }
 }
 
