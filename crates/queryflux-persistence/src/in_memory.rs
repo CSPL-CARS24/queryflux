@@ -210,11 +210,23 @@ impl Persistence for InMemoryPersistence {
 // MetricsStore — write completed query records and cluster snapshots
 // ---------------------------------------------------------------------------
 
+/// Maximum number of query records retained in memory. Oldest entries are
+/// evicted when the cap is reached so that long-running single-instance
+/// deployments don't grow without bound. Production deployments should use
+/// the Postgres backend; this store is intended for development only.
+const QUERY_RECORDS_MAX: usize = 10_000;
+
 #[async_trait]
 impl MetricsStore for InMemoryPersistence {
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let summary = self.record_to_summary(record);
-        self.query_records.write().unwrap().push(summary);
+        let mut records = self.query_records.write().unwrap();
+        if records.len() >= QUERY_RECORDS_MAX {
+            // Evict the oldest quarter to amortize the cost of repeated trimming.
+            let drain_count = QUERY_RECORDS_MAX / 4;
+            records.drain(..drain_count);
+        }
+        records.push(summary);
         Ok(())
     }
 

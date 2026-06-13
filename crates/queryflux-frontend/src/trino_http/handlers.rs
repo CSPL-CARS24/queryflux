@@ -729,7 +729,9 @@ pub async fn get_queued_statement(
                 outcome_to_response(&state, &query_id, outcome)
             }
             Err(QueryFluxError::SyncEngineRequired(_)) => {
-                let _ = state.persistence.delete_queued(&query_id).await;
+                if let Err(e) = state.persistence.delete_queued(&query_id).await {
+                    warn!(id = %query_id, "Failed to delete queued record on sync fallback: {e}");
+                }
                 let mut sink = TrinoHttpResultSink::new(&query_id.0);
                 if let Err(e) = execute_to_sink(
                     &state,
@@ -754,7 +756,9 @@ pub async fn get_queued_statement(
             }
         }
     } else {
-        let _ = state.persistence.delete_queued(&query_id).await;
+        if let Err(e) = state.persistence.delete_queued(&query_id).await {
+            warn!(id = %query_id, "Failed to delete queued record before sync dispatch: {e}");
+        }
         let mut sink = TrinoHttpResultSink::new(&query_id.0);
         if let Err(e) = execute_to_sink(
             &state,
@@ -820,7 +824,9 @@ pub async fn get_executing_statement(
                         &executing.id.0,
                     )
                     .await;
-                let _ = state.persistence.delete(&backend_id).await;
+                if let Err(e) = state.persistence.delete(&backend_id).await {
+                    warn!(id = %executing.id, "Failed to delete executing record: {e}");
+                }
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         },
@@ -836,7 +842,9 @@ pub async fn get_executing_statement(
                     &executing.id.0,
                 )
                 .await;
-            let _ = state.persistence.delete(&backend_id).await;
+            if let Err(e) = state.persistence.delete(&backend_id).await {
+                warn!(id = %executing.id, "Failed to delete executing record: {e}");
+            }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -877,7 +885,9 @@ pub async fn get_executing_statement(
                     &executing.id.0,
                 )
                 .await;
-            let _ = state.persistence.delete(&backend_id).await;
+            if let Err(e) = state.persistence.delete(&backend_id).await {
+                warn!(id = %executing.id, "Failed to delete executing record after poll error: {e}");
+            }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -917,10 +927,15 @@ pub async fn get_executing_statement(
     };
 
     // Guard actions captured at submit time — injected into the final record_query call.
-    let submit_guard_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
+    let submit_guard_actions: Vec<queryflux_persistence::GuardAction> = match serde_json::from_value(
         serde_json::Value::Array(executing.submitted_guard_actions.clone()),
-    )
-    .unwrap_or_default();
+    ) {
+        Ok(actions) => actions,
+        Err(e) => {
+            warn!(id = %executing.id, "Failed to deserialize stored guard actions — audit record will be incomplete: {e}");
+            vec![]
+        }
+    };
     let submit_was_guard_blocked = executing.was_guard_blocked;
 
     match poll_result {
@@ -952,7 +967,9 @@ pub async fn get_executing_statement(
                         &executing.id.0,
                     )
                     .await;
-                let _ = state.persistence.delete(&backend_id).await;
+                if let Err(e) = state.persistence.delete(&backend_id).await {
+                    warn!(id = %executing.id, "Failed to delete executing record on completion: {e}");
+                }
                 return raw_response_with_rewritten_next_uri(body, None).into_response();
             }
 
@@ -986,7 +1003,9 @@ pub async fn get_executing_statement(
                 )
                 .await;
             warn!(id = %executing.id, "Query failed: {message}");
-            let _ = state.persistence.delete(&backend_id).await;
+            if let Err(e) = state.persistence.delete(&backend_id).await {
+                warn!(id = %executing.id, "Failed to delete executing record on failure: {e}");
+            }
             let error_resp = TrinoResponse {
                 id: executing.id.0.clone(),
                 next_uri: None,
@@ -1056,7 +1075,9 @@ pub async fn delete_executing_statement(
                 &executing.id.0,
             )
             .await;
-        let _ = state.persistence.delete(&backend_id).await;
+        if let Err(e) = state.persistence.delete(&backend_id).await {
+            warn!(id = %executing.id, "Failed to delete executing record on cancel: {e}");
+        }
     }
 
     StatusCode::NO_CONTENT.into_response()

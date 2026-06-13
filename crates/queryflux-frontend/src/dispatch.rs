@@ -130,6 +130,7 @@ pub async fn dispatch_query(
         group_default_tags,
         guard_chain,
         group_guard_chain,
+        cluster_cfg,
     ) = {
         let live = state.live.read().await;
         (
@@ -145,6 +146,9 @@ pub async fn dispatch_query(
                 .unwrap_or_default(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
+            // cluster_cfg resolved after cluster selection below; captured here
+            // so credential resolution uses the same config generation.
+            live.cluster_configs.clone(),
         )
     };
 
@@ -179,25 +183,27 @@ pub async fn dispatch_query(
 
     let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
         Some(c) => {
-            if !acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
-                // Global capacity full — release local slot and queue.
-                let _ = cluster_manager.release_cluster(&group, &c).await;
-                let uri = persist_queued_query(
-                    state,
-                    query_id,
-                    sql,
-                    session,
-                    protocol,
-                    group,
-                    already_queued,
-                    sequence,
-                )
-                .await?;
-                return Ok(DispatchOutcome::Queued {
-                    queued_next_uri: uri,
-                });
+            match acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
+                CapacityGrant::Denied => {
+                    // Global capacity full — release local slot and queue.
+                    let _ = cluster_manager.release_cluster(&group, &c).await;
+                    let uri = persist_queued_query(
+                        state,
+                        query_id,
+                        sql,
+                        session,
+                        protocol,
+                        group,
+                        already_queued,
+                        sequence,
+                    )
+                    .await?;
+                    return Ok(DispatchOutcome::Queued {
+                        queued_next_uri: uri,
+                    });
+                }
+                CapacityGrant::Granted | CapacityGrant::GrantedDegraded => c,
             }
-            c
         }
         None => {
             let uri = persist_queued_query(
@@ -235,10 +241,10 @@ pub async fn dispatch_query(
 
     state.metrics.on_query_started(&group.0, &cluster_name.0);
 
-    let cluster_cfg = state.cluster_config_cloned(&cluster_name.0).await;
+    let this_cluster_cfg = cluster_cfg.get(&cluster_name.0).cloned();
     let credentials = state
         .identity_resolver
-        .resolve(auth_ctx, cluster_cfg.as_ref())
+        .resolve(auth_ctx, this_cluster_cfg.as_ref())
         .await;
 
     let adapter_kind = match state.adapter(&cluster_name.0).await {
@@ -367,7 +373,13 @@ pub async fn dispatch_query(
     // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
     let submitted_guard_actions: Vec<serde_json::Value> = all_guard_actions
         .iter()
-        .filter_map(|a| serde_json::to_value(a).ok())
+        .filter_map(|a| match serde_json::to_value(a) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!(guard = %a.guard, "Failed to serialize guard action — omitted from audit record: {e}");
+                None
+            }
+        })
         .collect();
 
     match adapter_kind {
@@ -423,11 +435,17 @@ pub async fn dispatch_query(
             };
             // Slot ownership transfers to the executing record: poll, cancel,
             // and zombie-eviction paths release it from here on. If the record
-            // can't be persisted, no terminal path would ever see this query —
-            // release the slot and fail the dispatch (the engine-side query is
-            // orphaned either way, but capacity accounting stays correct).
+            // can't be persisted, cancel the engine-side query best-effort so
+            // it doesn't burn cluster resources invisibly, then release the slot.
             if let Err(e) = state.persistence.upsert(executing.clone()).await {
                 warn!(id = %query_id, "Failed to persist executing query: {e}");
+                let cancel_adapter = adapter.clone();
+                let cancel_id = backend_query_id.clone();
+                tokio::spawn(async move {
+                    if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
+                        warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
+                    }
+                });
                 slot.release().await;
                 return Err(QueryFluxError::Persistence(format!(
                     "persist executing query: {e}"
@@ -783,8 +801,14 @@ const QUEUE_ACTIVE_WINDOW_SECS: i64 = 15;
 /// `queued_since` is the caller's own enqueue time (`None` = never queued, so
 /// every active waiter outranks it). The free-slot check runs first and is
 /// in-memory, so under healthy load the gate never touches the backend.
-/// Backend errors fail open — fairness degrades to today's poll-order rather
-/// than blocking admission.
+/// Backend errors fail open — fairness degrades to poll-order rather than
+/// blocking admission.
+///
+/// **Best-effort ordering**: there is an inherent race between this check and
+/// the actual slot acquisition that follows. Under distributed load an older
+/// waiter may be dispatched by a different replica in that window, making the
+/// yield decision stale. The gate provides FIFO *on average* — it is not a
+/// strict ordering guarantee.
 async fn should_yield_to_older_queued(
     state: &Arc<AppState>,
     cluster_manager: &Arc<dyn ClusterGroupManager>,
@@ -818,32 +842,44 @@ async fn should_yield_to_older_queued(
     }
 }
 
+/// Result of a global capacity acquisition attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityGrant {
+    /// Capacity confirmed available by the coordination backend.
+    Granted,
+    /// Coordination backend unreachable; proceeding on local limits only.
+    /// The replica is in degraded mode for this operation.
+    GrantedDegraded,
+    /// Global capacity is full — caller must queue or back off.
+    Denied,
+}
+
 /// In distributed mode, take a global capacity lease for a cluster slot that
-/// was just acquired locally. Returns `false` when global capacity is full —
-/// the caller must release the local slot and queue or back off. Coordination
-/// failures fail open (proceed on local limits alone) and are counted in
-/// `queryflux_coordination_failures_total`. Always `true` outside distributed
-/// mode.
+/// was just acquired locally. Coordination failures fail open (proceed on local
+/// limits alone) and are counted in `queryflux_coordination_failures_total`.
+/// Returns `CapacityGrant::GrantedDegraded` in that case so callers can log or
+/// alert on degraded-mode admits. Always `Granted` outside distributed mode.
 async fn acquire_global_capacity(
     state: &Arc<AppState>,
     cluster_manager: &Arc<dyn ClusterGroupManager>,
     group: &ClusterGroupName,
     cluster: &ClusterName,
     query_id: &str,
-) -> bool {
+) -> CapacityGrant {
     let Some(cap) = &state.capacity_store else {
-        return true;
+        return CapacityGrant::Granted;
     };
     let max_rq = effective_max_running(cluster_manager, group, cluster).await;
     match cap
         .try_acquire(&cluster.0, max_rq, &state.instance_id, query_id)
         .await
     {
-        Ok(granted) => granted,
+        Ok(true) => CapacityGrant::Granted,
+        Ok(false) => CapacityGrant::Denied,
         Err(e) => {
             state.metrics.on_coordination_failure("capacity_acquire");
             tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
-            true
+            CapacityGrant::GrantedDegraded
         }
     }
 }
@@ -1110,7 +1146,7 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags) = {
+    let (cluster_manager, group_fixups, group_default_tags, cluster_configs) = {
         let live = state.live.read().await;
         (
             live.cluster_manager.clone(),
@@ -1122,6 +1158,7 @@ async fn setup_sync_query(
                 .get(&group.0)
                 .cloned()
                 .unwrap_or_default(),
+            live.cluster_configs.clone(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1139,8 +1176,9 @@ async fn setup_sync_query(
         }
         match cluster_manager.acquire_cluster(&group).await? {
             Some(name) => {
-                if !acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
+                if acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
                     .await
+                    == CapacityGrant::Denied
                 {
                     // Global capacity full — release local slot and retry with backoff.
                     let _ = cluster_manager.release_cluster(&group, &name).await;
@@ -1246,10 +1284,10 @@ async fn setup_sync_query(
 
     let was_translated = translated != sql;
 
-    let cluster_cfg = state.cluster_config_cloned(&cluster_name.0).await;
+    let this_cluster_cfg = cluster_configs.get(&cluster_name.0).cloned();
     let credentials = state
         .identity_resolver
-        .resolve(auth_ctx, cluster_cfg.as_ref())
+        .resolve(auth_ctx, this_cluster_cfg.as_ref())
         .await;
 
     // Fallback interpolation: when the adapter does not support native params,
