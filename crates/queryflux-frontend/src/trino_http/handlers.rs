@@ -852,7 +852,11 @@ pub async fn get_executing_statement(
     // Reconstruct the full Trino poll URL: stored base URL + /v1/statement/ + captured path.
     let trino_url = format!(
         "{}/v1/statement/{}",
-        executing.poll_base_url.as_deref().unwrap_or_default().trim_end_matches('/'),
+        executing
+            .poll_base_url
+            .as_deref()
+            .unwrap_or_default()
+            .trim_end_matches('/'),
         trino_path
     );
 
@@ -1062,7 +1066,11 @@ pub async fn delete_executing_statement(
     if let Ok(Some(executing)) = state.persistence.get(&backend_id).await {
         let trino_url = format!(
             "{}/v1/statement/{}",
-            executing.poll_base_url.as_deref().unwrap_or_default().trim_end_matches('/'),
+            executing
+                .poll_base_url
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('/'),
             trino_path
         );
         let client = reqwest::Client::new();

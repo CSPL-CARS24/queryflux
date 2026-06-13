@@ -124,4 +124,11 @@ pub trait MetricsStore: Send + Sync {
     /// A sustained non-zero rate means the global `max_running_queries` limit and
     /// single-owner queue claiming are NOT being enforced — alert on it.
     fn on_coordination_failure(&self, _operation: &str) {}
+
+    /// Called when a query is admitted in degraded mode — the global capacity
+    /// lease could not be acquired (Postgres unreachable) and the replica fell
+    /// back to local-only limits. The query proceeds, but global `max_running_queries`
+    /// is not enforced for this admit. A sustained rate indicates the coordination
+    /// backend is degraded; pair with `coordination_failures_total` alerts.
+    fn on_capacity_degraded(&self, _cluster_group: &str, _cluster_name: &str) {}
 }

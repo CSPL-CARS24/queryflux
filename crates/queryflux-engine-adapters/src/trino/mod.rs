@@ -604,8 +604,12 @@ impl AsyncAdapter for TrinoAdapter {
             )
             .await?;
         let initial_response = match execution {
-            QueryExecution::Running { initial_response, .. } => initial_response,
-            QueryExecution::Completed { initial_response, .. } => initial_response,
+            QueryExecution::Running {
+                initial_response, ..
+            } => initial_response,
+            QueryExecution::Completed {
+                initial_response, ..
+            } => initial_response,
         };
         if let Some(body) = initial_response {
             let resp: TrinoResponse = serde_json::from_slice(&body)
@@ -700,8 +704,12 @@ impl TrinoAdapter {
             )
             .await?;
         let initial_response = match execution {
-            QueryExecution::Running { initial_response, .. } => initial_response,
-            QueryExecution::Completed { initial_response, .. } => initial_response,
+            QueryExecution::Running {
+                initial_response, ..
+            } => initial_response,
+            QueryExecution::Completed {
+                initial_response, ..
+            } => initial_response,
         };
         if let Some(body) = initial_response {
             let resp: TrinoResponse = serde_json::from_slice(&body)

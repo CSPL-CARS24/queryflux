@@ -1210,6 +1210,11 @@ async fn main() -> Result<()> {
                 if let Some(backend) = backend {
                     do_reload(backend, cache, live).await;
                 } else {
+                    // YAML-mode reload contract: without a Postgres backend, routing rules,
+                    // cluster configs, and adapters are fixed at startup from the YAML file
+                    // and cannot change at runtime. Only guard chains (stored in the admin
+                    // store) can be hot-reloaded via the admin API. Routing or cluster
+                    // changes in YAML require a process restart.
                     reload_guard_chain_from_admin(admin, live).await;
                 }
             }
@@ -1487,6 +1492,95 @@ fn health_targets_from_groups(
         }
     }
     out
+}
+
+/// Validate referential integrity of a config that is about to go live.
+///
+/// Returns a list of human-readable issue strings (empty = valid). Callers should
+/// treat any non-empty return as a fatal config error and keep the previous LiveConfig.
+///
+/// Checks:
+///  - `routing_fallback` names a group that exists in `group_members`.
+///  - Every static `target_group` reference in `routers_cfg` names a group in `group_members`.
+///    (PythonScript routers are skipped — their target group is computed at runtime.)
+///  - Every cluster name listed in `group_members` has a built adapter in `adapters`.
+fn validate_live_config_refs(
+    routers_cfg: &[queryflux_core::config::RouterConfig],
+    routing_fallback: &str,
+    group_members: &HashMap<String, Vec<String>>,
+    adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
+) -> Vec<String> {
+    use queryflux_core::config::RouterConfig;
+
+    let mut issues: Vec<String> = Vec::new();
+
+    if !group_members.contains_key(routing_fallback) {
+        issues.push(format!(
+            "routing_fallback references unknown group '{routing_fallback}'"
+        ));
+    }
+
+    for router in routers_cfg {
+        let mut refs: Vec<&str> = Vec::new();
+        match router {
+            RouterConfig::ProtocolBased {
+                trino_http,
+                postgres_wire,
+                mysql_wire,
+                clickhouse_http,
+                flight_sql,
+                snowflake_http,
+                snowflake_sql_api,
+            } => {
+                let opts: [Option<&str>; 7] = [
+                    trino_http.as_deref(),
+                    postgres_wire.as_deref(),
+                    mysql_wire.as_deref(),
+                    clickhouse_http.as_deref(),
+                    flight_sql.as_deref(),
+                    snowflake_http.as_deref(),
+                    snowflake_sql_api.as_deref(),
+                ];
+                refs.extend(opts.into_iter().flatten());
+            }
+            RouterConfig::Header {
+                header_value_to_group,
+                ..
+            } => {
+                refs.extend(header_value_to_group.values().map(String::as_str));
+            }
+            RouterConfig::UserGroup { user_to_group } => {
+                refs.extend(user_to_group.values().map(String::as_str));
+            }
+            RouterConfig::QueryRegex { rules } => {
+                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
+            }
+            RouterConfig::Tags { rules } => {
+                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
+            }
+            RouterConfig::Compound { target_group, .. } => {
+                refs.push(target_group.as_str());
+            }
+            RouterConfig::PythonScript { .. } => {}
+        }
+        for group in refs {
+            if !group_members.contains_key(group) {
+                issues.push(format!("router references unknown group '{group}'"));
+            }
+        }
+    }
+
+    for (group, members) in group_members {
+        for member in members {
+            if !adapters.contains_key(member.as_str()) {
+                issues.push(format!(
+                    "group '{group}' member '{member}' has no built adapter"
+                ));
+            }
+        }
+    }
+
+    issues
 }
 
 /// Build a `LiveConfig` from DB cluster records, group maps, and router chain components.
@@ -1812,6 +1906,27 @@ async fn build_live_config(
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
+
+    // Referential integrity: routers must target groups that exist in this reload cycle,
+    // and every declared group member must have a built adapter. A stale read (e.g. a
+    // group deleted between the cluster read and the group read) would produce a live
+    // config where dispatch returns NoClusterGroupAvailable with no explanation.
+    // On any inconsistency, bail out so the caller keeps the previous LiveConfig.
+    let issues = validate_live_config_refs(
+        routers_cfg,
+        routing_fallback,
+        &group_members,
+        &cache.adapters,
+    );
+    if !issues.is_empty() {
+        for issue in &issues {
+            tracing::warn!("Live config validation: {issue}");
+        }
+        return Err(anyhow::anyhow!(
+            "Live config is internally inconsistent ({} issue(s)); keeping previous config",
+            issues.len()
+        ));
+    }
 
     Ok(LiveConfig {
         router_chain,

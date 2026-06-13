@@ -32,6 +32,12 @@ pub struct PrometheusMetrics {
     /// fell back to local-only behavior, so global limits were not enforced for
     /// that operation — alert on a sustained rate.
     coordination_failures_total: CounterVec,
+    /// queryflux_capacity_degraded_total{cluster_group, cluster_name}
+    ///
+    /// Queries admitted in degraded mode — global capacity lease unavailable,
+    /// replica fell back to local limits. Non-zero means global max_running_queries
+    /// was not enforced for those admits. Pair with coordination_failures_total.
+    capacity_degraded_total: CounterVec,
     /// Tag keys that are excluded from `query_tags_total` to control cardinality.
     tags_deny_list: Vec<String>,
 }
@@ -102,6 +108,14 @@ impl PrometheusMetrics {
             &["operation"],
         )?;
 
+        let capacity_degraded_total = CounterVec::new(
+            Opts::new(
+                "queryflux_capacity_degraded_total",
+                "Queries admitted in degraded mode (global capacity lease unavailable, local limits used)",
+            ),
+            &["cluster_group", "cluster_name"],
+        )?;
+
         registry.register(Box::new(queries_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
         registry.register(Box::new(translated_total.clone()))?;
@@ -109,6 +123,7 @@ impl PrometheusMetrics {
         registry.register(Box::new(queued_queries.clone()))?;
         registry.register(Box::new(query_tags_total.clone()))?;
         registry.register(Box::new(coordination_failures_total.clone()))?;
+        registry.register(Box::new(capacity_degraded_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -119,6 +134,7 @@ impl PrometheusMetrics {
             queued_queries,
             query_tags_total,
             coordination_failures_total,
+            capacity_degraded_total,
             tags_deny_list,
         })
     }
@@ -161,6 +177,12 @@ impl MetricsStore for PrometheusMetrics {
     fn on_coordination_failure(&self, operation: &str) {
         self.coordination_failures_total
             .with_label_values(&[operation])
+            .inc();
+    }
+
+    fn on_capacity_degraded(&self, cluster_group: &str, cluster_name: &str) {
+        self.capacity_degraded_total
+            .with_label_values(&[cluster_group, cluster_name])
             .inc();
     }
 

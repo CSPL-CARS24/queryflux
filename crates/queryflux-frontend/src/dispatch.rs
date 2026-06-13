@@ -201,7 +201,11 @@ pub async fn dispatch_query(
                         queued_next_uri: uri,
                     });
                 }
-                CapacityGrant::Granted | CapacityGrant::GrantedDegraded => c,
+                CapacityGrant::Granted => c,
+                CapacityGrant::GrantedDegraded => {
+                    state.metrics.on_capacity_degraded(&group.0, &c.0);
+                    c
+                }
             }
         }
         None => {
@@ -407,8 +411,12 @@ pub async fn dispatch_query(
 
             // Extract backend_query_id first so we can build ExecutingQuery before branching.
             let backend_query_id = match &execution {
-                QueryExecution::Running { backend_query_id, .. } => backend_query_id.clone(),
-                QueryExecution::Completed { backend_query_id, .. } => backend_query_id.clone(),
+                QueryExecution::Running {
+                    backend_query_id, ..
+                } => backend_query_id.clone(),
+                QueryExecution::Completed {
+                    backend_query_id, ..
+                } => backend_query_id.clone(),
             };
             let now = Utc::now();
             let executing = ExecutingQuery {
@@ -508,7 +516,12 @@ pub async fn dispatch_query(
                         agent_context: executing.agent_context.clone(),
                     };
                     finalize_async_terminal_on_submit(
-                        state, &executing, ctx, status, error, engine_stats,
+                        state,
+                        &executing,
+                        ctx,
+                        status,
+                        error,
+                        engine_stats,
                     )
                     .await;
                     Ok(DispatchOutcome::Async {
@@ -523,9 +536,7 @@ pub async fn dispatch_query(
             // round-robin in a mixed group signals the caller to retry via
             // execute_to_sink, which will drive its own slot acquisition loop.
             slot.release().await;
-            Err(QueryFluxError::SyncEngineRequired(
-                cluster_name.0.clone(),
-            ))
+            Err(QueryFluxError::SyncEngineRequired(cluster_name.0.clone()))
         }
     }
 }
@@ -996,15 +1007,20 @@ async fn setup_sync_query(
         }
         match cluster_manager.acquire_cluster(&group).await? {
             Some(name) => {
-                if acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
+                match acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
                     .await
-                    == CapacityGrant::Denied
                 {
-                    // Global capacity full — release local slot and retry with backoff.
-                    let _ = cluster_manager.release_cluster(&group, &name).await;
-                    queued_backoff_delay(seq).await;
-                    seq += 1;
-                    continue;
+                    CapacityGrant::Denied => {
+                        // Global capacity full — release local slot and retry with backoff.
+                        let _ = cluster_manager.release_cluster(&group, &name).await;
+                        queued_backoff_delay(seq).await;
+                        seq += 1;
+                        continue;
+                    }
+                    CapacityGrant::GrantedDegraded => {
+                        state.metrics.on_capacity_degraded(&group.0, &name.0);
+                    }
+                    CapacityGrant::Granted => {}
                 }
                 match state.adapter(&name.0).await {
                     Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
