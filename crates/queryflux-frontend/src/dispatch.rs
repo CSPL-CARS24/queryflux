@@ -123,7 +123,14 @@ pub async fn dispatch_query(
 ) -> Result<DispatchOutcome> {
     // Snapshot all live config fields in one lock acquisition. The guard is
     // dropped before any await point so no lock is held during I/O.
-    let (authorization, cluster_manager, group_fixups, group_default_tags, guard_chain, group_guard_chain) = {
+    let (
+        authorization,
+        cluster_manager,
+        group_fixups,
+        group_default_tags,
+        guard_chain,
+        group_guard_chain,
+    ) = {
         let live = state.live.read().await;
         (
             live.authorization.clone(),
@@ -1107,8 +1114,14 @@ async fn setup_sync_query(
         let live = state.live.read().await;
         (
             live.cluster_manager.clone(),
-            live.group_translation_scripts.get(&group.0).cloned().unwrap_or_default(),
-            live.group_default_tags.get(&group.0).cloned().unwrap_or_default(),
+            live.group_translation_scripts
+                .get(&group.0)
+                .cloned()
+                .unwrap_or_default(),
+            live.group_default_tags
+                .get(&group.0)
+                .cloned()
+                .unwrap_or_default(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
