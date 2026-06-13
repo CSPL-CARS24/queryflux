@@ -33,7 +33,6 @@ pub fn parse_snowflake_json_body(headers: &HeaderMap, body: &Bytes) -> Result<Va
     serde_json::from_slice(&decoded).map_err(|e| e.to_string())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

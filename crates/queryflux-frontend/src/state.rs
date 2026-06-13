@@ -22,7 +22,6 @@ use queryflux_persistence::{CapacityStore, Persistence, QueueCoordinator};
 use queryflux_routing::chain::{RouterChain, RoutingTrace};
 use queryflux_translation::TranslationService;
 
-
 /// Everything that can be hot-reloaded from the DB without restarting the proxy.
 ///
 /// Wrapped in `Arc<tokio::sync::RwLock<LiveConfig>>` inside `AppState` so

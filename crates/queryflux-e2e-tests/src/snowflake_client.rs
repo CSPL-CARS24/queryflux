@@ -45,11 +45,7 @@ impl SnowflakeClient {
     /// ```json
     /// { "1": {"type": "FIXED", "value": "42"} }
     /// ```
-    pub async fn query(
-        &self,
-        sql: &str,
-        bindings: Option<Value>,
-    ) -> Result<SfQueryResult> {
+    pub async fn query(&self, sql: &str, bindings: Option<Value>) -> Result<SfQueryResult> {
         let mut body = json!({"statement": sql});
         if let Some(b) = bindings {
             body["bindings"] = b;
@@ -74,9 +70,7 @@ impl SnowflakeClient {
             });
         }
 
-        let num_rows = resp["resultSetMetaData"]["numRows"]
-            .as_u64()
-            .unwrap_or(0);
+        let num_rows = resp["resultSetMetaData"]["numRows"].as_u64().unwrap_or(0);
         let rows = decode_jsonv2_rows(&resp)?;
 
         Ok(SfQueryResult {
