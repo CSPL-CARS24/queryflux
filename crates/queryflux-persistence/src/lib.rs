@@ -56,6 +56,23 @@ pub trait Persistence: Send + Sync {
 
     /// Delete all queued queries whose `last_accessed` is older than `cutoff`.
     async fn delete_queued_not_accessed_since(&self, cutoff: DateTime<Utc>) -> Result<u64>;
+
+    /// Number of queued queries for `cluster_group` that are still actively
+    /// polling (`last_accessed >= active_after`) and were enqueued strictly
+    /// before `enqueued_before` (`None` treats the caller as the newest
+    /// possible, so every active waiter counts).
+    ///
+    /// Powers the admission fairness gate: a query may only take a freed slot
+    /// when the group's free capacity exceeds the number of older waiters.
+    /// The activity window is what prevents head-of-line blocking — a client
+    /// that stopped polling drops out of the count within seconds instead of
+    /// holding the queue hostage until stale-queue cleanup.
+    async fn count_active_queued_before(
+        &self,
+        cluster_group: &str,
+        enqueued_before: Option<DateTime<Utc>>,
+        active_after: DateTime<Utc>,
+    ) -> Result<u64>;
 }
 
 // ---------------------------------------------------------------------------

@@ -115,6 +115,9 @@ pub async fn dispatch_query(
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     already_queued: bool,
+    // When this query was first enqueued (`None` for a query that has never
+    // been queued). Drives the admission fairness gate: older waiters win.
+    queued_since: Option<chrono::DateTime<Utc>>,
     sequence: u64,
     auth_ctx: &AuthContext,
 ) -> Result<DispatchOutcome> {
@@ -145,6 +148,26 @@ pub async fn dispatch_query(
         )
     };
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
+
+    // Admission fairness: don't take a slot that an older, actively-polling
+    // queued query is waiting for. Only binds when capacity is scarce — with
+    // free slots to spare the gate is a cheap local check and admits.
+    if should_yield_to_older_queued(state, &cluster_manager, &group, queued_since).await {
+        let uri = persist_queued_query(
+            state,
+            query_id,
+            sql,
+            session,
+            protocol,
+            group,
+            already_queued,
+            sequence,
+        )
+        .await?;
+        return Ok(DispatchOutcome::Queued {
+            queued_next_uri: uri,
+        });
+    }
 
     let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
         Some(c) => {
@@ -734,6 +757,59 @@ async fn effective_max_running(
         .unwrap_or(u64::MAX)
 }
 
+/// How recently a queued query must have been polled to count as an active
+/// waiter in the fairness gate. Trino clients poll about once a second, so a
+/// client gone for this long has almost certainly disconnected — excluding it
+/// keeps a dead client from blocking admission (head-of-line) until the
+/// stale-queue cleanup removes its row minutes later.
+const QUEUE_ACTIVE_WINDOW_SECS: i64 = 15;
+
+/// Admission fairness gate: should this query yield instead of taking a slot?
+///
+/// True only when both hold:
+/// 1. the group's free capacity (local snapshot) does not exceed the number of
+///    older, actively-polling queued queries — i.e. every remaining slot is
+///    spoken for by someone who was here first, and
+/// 2. such waiters exist at all.
+///
+/// `queued_since` is the caller's own enqueue time (`None` = never queued, so
+/// every active waiter outranks it). The free-slot check runs first and is
+/// in-memory, so under healthy load the gate never touches the backend.
+/// Backend errors fail open — fairness degrades to today's poll-order rather
+/// than blocking admission.
+async fn should_yield_to_older_queued(
+    state: &Arc<AppState>,
+    cluster_manager: &Arc<dyn ClusterGroupManager>,
+    group: &ClusterGroupName,
+    queued_since: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    let free = match cluster_manager.all_cluster_states().await {
+        Ok(snaps) => snaps
+            .iter()
+            .filter(|s| s.group_name.0 == group.0 && s.enabled && s.is_healthy)
+            .map(|s| s.max_running_queries.saturating_sub(s.running_queries))
+            .sum::<u64>(),
+        // Can't tell — don't block admission on a read failure.
+        Err(_) => return false,
+    };
+    if free == 0 {
+        // Nothing to take; acquire_cluster will queue this query anyway.
+        return false;
+    }
+    let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
+    match state
+        .persistence
+        .count_active_queued_before(&group.0, queued_since, active_after)
+        .await
+    {
+        Ok(older_waiters) => older_waiters >= free,
+        Err(e) => {
+            warn!("Fairness gate query failed; admitting without ordering: {e}");
+            false
+        }
+    }
+}
+
 /// In distributed mode, take a global capacity lease for a cluster slot that
 /// was just acquired locally. Returns `false` when global capacity is full —
 /// the caller must release the local slot and queue or back off. Coordination
@@ -1043,8 +1119,16 @@ async fn setup_sync_query(
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
 
     // Queue loop: spin until a cluster slot is available (both local and global).
+    // `wait_start` is this query's place in line for the fairness gate: queued
+    // queries enqueued before it (and still polling) get freed slots first.
+    let wait_start = Utc::now();
     let mut seq: u64 = 0;
     let (cluster_name, adapter) = loop {
+        if should_yield_to_older_queued(state, &cluster_manager, &group, Some(wait_start)).await {
+            queued_backoff_delay(seq).await;
+            seq += 1;
+            continue;
+        }
         match cluster_manager.acquire_cluster(&group).await? {
             Some(name) => {
                 if !acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)

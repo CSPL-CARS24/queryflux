@@ -1286,14 +1286,34 @@ impl Persistence for PostgresStore {
 
     async fn upsert_queued(&self, query: QueuedQuery) -> Result<()> {
         let id = query.id.0.clone();
+        let group = query.cluster_group.0.clone();
+        let last_accessed = query.last_accessed;
         let data = serde_json::to_value(&query)
             .map_err(|e| QueryFluxError::Persistence(format!("Serialize error: {e}")))?;
+        // Re-queues rebuild the QueuedQuery with a fresh creation_time; keep
+        // the original so it always means "first enqueued at" — the fairness
+        // gate orders waiters by it.
         sqlx::query(
-            "INSERT INTO queued_queries (id, data) VALUES ($1, $2)
-             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+            r#"
+            INSERT INTO queued_queries (id, data, cluster_group, last_accessed)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE SET
+                data = jsonb_set(
+                    EXCLUDED.data,
+                    '{creation_time}',
+                    COALESCE(
+                        queued_queries.data->'creation_time',
+                        EXCLUDED.data->'creation_time'
+                    )
+                ),
+                cluster_group = EXCLUDED.cluster_group,
+                last_accessed = EXCLUDED.last_accessed
+            "#,
         )
         .bind(&id)
         .bind(data)
+        .bind(&group)
+        .bind(last_accessed)
         .execute(&self.pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Upsert queued_queries: {e}")))?;
@@ -1344,17 +1364,41 @@ impl Persistence for PostgresStore {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        // last_accessed is stored inside the JSONB data blob.
-        let result = sqlx::query(
-            "DELETE FROM queued_queries WHERE (data->>'last_accessed')::timestamptz < $1",
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            QueryFluxError::Persistence(format!("delete_queued_not_accessed_since: {e}"))
-        })?;
+        let result = sqlx::query("DELETE FROM queued_queries WHERE last_accessed < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                QueryFluxError::Persistence(format!("delete_queued_not_accessed_since: {e}"))
+            })?;
         Ok(result.rows_affected())
+    }
+
+    async fn count_active_queued_before(
+        &self,
+        cluster_group: &str,
+        enqueued_before: Option<DateTime<Utc>>,
+        active_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        // creation_time is compared from the JSONB blob (preserved across
+        // re-queues by upsert_queued) so both sides of the comparison come
+        // from the application clock; the indexed columns narrow the scan.
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM queued_queries
+            WHERE cluster_group = $1
+              AND last_accessed >= $2
+              AND ($3::timestamptz IS NULL
+                   OR (data->>'creation_time')::timestamptz < $3)
+            "#,
+        )
+        .bind(cluster_group)
+        .bind(active_after)
+        .bind(enqueued_before)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("count_active_queued_before: {e}")))?;
+        Ok(count.max(0) as u64)
     }
 }
 
@@ -2073,6 +2117,148 @@ mod tests {
         assert!(count >= 1, "heartbeated lease must survive expiry");
 
         store.release("test-cluster-hb", &qid).await.unwrap();
+    }
+
+    // -- Admission fairness ---------------------------------------------------
+
+    fn make_queued_at(
+        id: &str,
+        group: &str,
+        creation_time: chrono::DateTime<chrono::Utc>,
+        last_accessed: chrono::DateTime<chrono::Utc>,
+    ) -> QueuedQuery {
+        QueuedQuery {
+            id: ProxyQueryId(id.to_string()),
+            sql: "SELECT 1".to_string(),
+            session: SessionContext::default(),
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            cluster_group: ClusterGroupName(group.to_string()),
+            creation_time,
+            last_accessed,
+            sequence: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queued_creation_time_preserved_on_requeue() {
+        let store = test_store().await;
+        let qid = unique_id("ct");
+        let group = unique_id("g");
+        let original = chrono::Utc::now() - chrono::Duration::minutes(10);
+
+        store
+            .upsert_queued(make_queued_at(&qid, &group, original, chrono::Utc::now()))
+            .await
+            .unwrap();
+        // Re-queue with a fresh creation_time, as persist_queued_query does.
+        store
+            .upsert_queued(make_queued_at(
+                &qid,
+                &group,
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        let q = store
+            .get_queued(&ProxyQueryId(qid.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            q.creation_time.timestamp_millis(),
+            original.timestamp_millis(),
+            "creation_time must survive re-queues"
+        );
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_count_active_queued_before_orders_and_filters() {
+        let store = test_store().await;
+        let group = unique_id("fair");
+        let now = chrono::Utc::now();
+        let active_after = now - chrono::Duration::seconds(15);
+
+        let q_old = unique_id("old");
+        let q_new = unique_id("new");
+        let q_dead = unique_id("dead");
+        // Old and new are actively polling; dead stopped 10 minutes ago.
+        store
+            .upsert_queued(make_queued_at(
+                &q_old,
+                &group,
+                now - chrono::Duration::minutes(5),
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_queued(make_queued_at(
+                &q_new,
+                &group,
+                now - chrono::Duration::seconds(2),
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_queued(make_queued_at(
+                &q_dead,
+                &group,
+                now - chrono::Duration::minutes(20),
+                now - chrono::Duration::minutes(10),
+            ))
+            .await
+            .unwrap();
+
+        // A never-queued query sees both live waiters (dead client excluded).
+        assert_eq!(
+            store
+                .count_active_queued_before(&group, None, active_after)
+                .await
+                .unwrap(),
+            2
+        );
+        // The newer waiter sees only the older one ahead of it.
+        assert_eq!(
+            store
+                .count_active_queued_before(
+                    &group,
+                    Some(now - chrono::Duration::seconds(2)),
+                    active_after
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        // The oldest live waiter has nobody ahead.
+        assert_eq!(
+            store
+                .count_active_queued_before(
+                    &group,
+                    Some(now - chrono::Duration::minutes(5)),
+                    active_after
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        // Other groups are unaffected.
+        assert_eq!(
+            store
+                .count_active_queued_before("some-other-group", None, active_after)
+                .await
+                .unwrap(),
+            0
+        );
+
+        for q in [q_old, q_new, q_dead] {
+            store.delete_queued(&ProxyQueryId(q)).await.unwrap();
+        }
     }
 
     // -- SweepLock ------------------------------------------------------------

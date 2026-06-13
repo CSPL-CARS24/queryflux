@@ -445,6 +445,7 @@ pub async fn post_statement(
             protocol.clone(),
             group.clone(),
             false,
+            None,
             0,
             &auth_ctx,
         )
@@ -714,6 +715,7 @@ pub async fn get_queued_statement(
             protocol.clone(),
             group.clone(),
             true,
+            Some(queued.creation_time),
             seq,
             &auth_ctx,
         )

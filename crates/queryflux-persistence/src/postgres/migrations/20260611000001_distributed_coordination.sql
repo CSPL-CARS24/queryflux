@@ -93,3 +93,19 @@ CREATE INDEX IF NOT EXISTS queued_queries_unclaimed
 CREATE INDEX IF NOT EXISTS queued_queries_claimed_at
     ON queued_queries (claimed_at)
     WHERE claimed_by IS NOT NULL;
+
+-- Admission fairness: the gate asks "how many older, actively-polling queued
+-- queries does this group have?" before a query may take a freed slot.
+-- cluster_group and last_accessed are promoted out of the JSONB blob so the
+-- gate is one indexed query; rows written before this migration are backfilled.
+ALTER TABLE queued_queries
+    ADD COLUMN IF NOT EXISTS cluster_group TEXT,
+    ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMPTZ NOT NULL DEFAULT now();
+
+UPDATE queued_queries
+SET cluster_group = data->>'cluster_group',
+    last_accessed = COALESCE((data->>'last_accessed')::timestamptz, last_accessed)
+WHERE cluster_group IS NULL;
+
+CREATE INDEX IF NOT EXISTS queued_queries_group_active
+    ON queued_queries (cluster_group, last_accessed);

@@ -153,7 +153,13 @@ impl Persistence for InMemoryPersistence {
         Ok(self.executing.iter().map(|e| e.value().clone()).collect())
     }
 
-    async fn upsert_queued(&self, query: QueuedQuery) -> Result<()> {
+    async fn upsert_queued(&self, mut query: QueuedQuery) -> Result<()> {
+        // Re-queues rebuild the QueuedQuery with a fresh creation_time; keep
+        // the original so it always means "first enqueued at" — the fairness
+        // gate orders waiters by it.
+        if let Some(existing) = self.queued.get(&query.id.0) {
+            query.creation_time = existing.creation_time;
+        }
         self.queued.insert(query.id.0.clone(), query);
         Ok(())
     }
@@ -179,6 +185,24 @@ impl Persistence for InMemoryPersistence {
             }
         });
         Ok(removed)
+    }
+
+    async fn count_active_queued_before(
+        &self,
+        cluster_group: &str,
+        enqueued_before: Option<DateTime<Utc>>,
+        active_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        Ok(self
+            .queued
+            .iter()
+            .filter(|e| {
+                let q = e.value();
+                q.cluster_group.0 == cluster_group
+                    && q.last_accessed >= active_after
+                    && enqueued_before.is_none_or(|t| q.creation_time < t)
+            })
+            .count() as u64)
     }
 }
 
@@ -1128,6 +1152,72 @@ mod tests {
             .await
             .unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_creation_time_preserved_on_requeue() {
+        let store = InMemoryPersistence::new();
+        let original = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let mut q = make_queued("q-ct");
+        q.creation_time = original;
+        store.upsert_queued(q).await.unwrap();
+
+        // Re-queue with a fresh creation_time, as persist_queued_query does.
+        store.upsert_queued(make_queued("q-ct")).await.unwrap();
+
+        let got = store
+            .get_queued(&ProxyQueryId("q-ct".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.creation_time, original);
+    }
+
+    #[tokio::test]
+    async fn count_active_queued_before_orders_and_filters() {
+        let store = InMemoryPersistence::new();
+        let now = chrono::Utc::now();
+        let active_after = now - chrono::Duration::seconds(15);
+
+        let mut q_old = make_queued("q-old");
+        q_old.creation_time = now - chrono::Duration::minutes(5);
+        let mut q_new = make_queued("q-new");
+        q_new.creation_time = now - chrono::Duration::seconds(2);
+        let mut q_dead = make_queued("q-dead");
+        q_dead.creation_time = now - chrono::Duration::minutes(20);
+        q_dead.last_accessed = now - chrono::Duration::minutes(10);
+        for q in [q_old, q_new, q_dead] {
+            store.upsert_queued(q).await.unwrap();
+        }
+
+        // Never-queued caller sees both live waiters; the dead client is excluded.
+        assert_eq!(
+            store
+                .count_active_queued_before("test", None, active_after)
+                .await
+                .unwrap(),
+            2
+        );
+        // The newer waiter sees only the older one ahead of it.
+        assert_eq!(
+            store
+                .count_active_queued_before(
+                    "test",
+                    Some(now - chrono::Duration::seconds(2)),
+                    active_after
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        // Other groups are unaffected.
+        assert_eq!(
+            store
+                .count_active_queued_before("other", None, active_after)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
