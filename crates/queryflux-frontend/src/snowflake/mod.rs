@@ -1,7 +1,5 @@
 pub mod http;
 pub mod sql_api;
-#[cfg(test)]
-mod tests;
 
 use std::sync::Arc;
 
@@ -12,8 +10,12 @@ use tracing::info;
 use crate::state::AppState;
 use crate::FrontendListenerTrait;
 
-/// Combined Snowflake frontend — wire protocol (Form 1) + SQL REST API v2 (Form 2)
-/// on a single port with a single shared `Arc<AppState>`.
+/// Snowflake SQL API v2 frontend (`/api/v2/statements`).
+///
+/// The Snowflake wire-protocol v1 (`/session/v1/login-request`, `/queries/v1/query-request`,
+/// etc.) is not supported — it required process-local session storage which breaks under
+/// multi-replica deployments. Clients should use the SQL API v2 with per-request JWT or
+/// key-pair authentication instead.
 pub struct SnowflakeFrontend {
     state: Arc<AppState>,
     port: u16,
@@ -25,9 +27,7 @@ impl SnowflakeFrontend {
     }
 
     pub fn router(&self) -> Router {
-        http::routes()
-            .merge(sql_api::routes())
-            .with_state(self.state.clone())
+        sql_api::routes().with_state(self.state.clone())
     }
 }
 
@@ -38,7 +38,7 @@ impl FrontendListenerTrait for SnowflakeFrontend {
             .parse()
             .map_err(|e: std::net::AddrParseError| QueryFluxError::Other(e.into()))?;
 
-        info!("Snowflake frontend (wire + SQL API) listening on {addr}");
+        info!("Snowflake SQL API v2 frontend listening on {addr}");
 
         axum::serve(
             tokio::net::TcpListener::bind(addr)

@@ -299,10 +299,6 @@ impl TestHarness {
                 records: records.clone(),
             }),
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
-            snowflake_sessions:
-                queryflux_frontend::snowflake::http::session_store::SnowflakeSessionStore::new(
-                    Default::default(),
-                ),
             capacity_store: None,
             queue_coordinator: None,
             instance_id: "test-harness".to_string(),
@@ -310,8 +306,8 @@ impl TestHarness {
 
         let trino_fe = TrinoHttpFrontend::new(state.clone(), port);
         let snowflake_fe = SnowflakeFrontend::new(state, port);
-        // Serve both Trino HTTP (/v1/statement) and Snowflake HTTP (/session, /queries) on the
-        // same port so query-params e2e tests can use the Snowflake protocol with bindings.
+        // Serve both Trino HTTP (/v1/statement) and Snowflake SQL API v2 (/api/v2/statements)
+        // on the same port so query-params e2e tests can use the Snowflake protocol with bindings.
         let router: Router = trino_fe.router().merge(snowflake_fe.router());
         let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

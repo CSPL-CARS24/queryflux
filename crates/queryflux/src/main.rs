@@ -20,10 +20,7 @@ use queryflux_frontend::{
     flight_sql::FlightSqlFrontend,
     mysql_wire::MysqlWireFrontend,
     postgres_wire::PostgresWireFrontend,
-    snowflake::{
-        http::session_store::{SnowflakeHttpSessionPolicy, SnowflakeSessionStore},
-        SnowflakeFrontend,
-    },
+    snowflake::SnowflakeFrontend,
     state::LiveConfig,
     trino_http::{state::AppState, TrinoHttpFrontend},
     FrontendListenerTrait,
@@ -595,29 +592,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Snowflake HTTP: sessions are in-memory on this process only ---
-    if let Some(sf) = config.queryflux.frontends.snowflake_http.as_ref() {
-        if sf.enabled {
-            if config.queryflux.enforce_snowflake_http_session_affinity
-                && !sf.session_affinity_acknowledged
-            {
-                anyhow::bail!(
-                    "Snowflake HTTP is enabled and queryflux.enforceSnowflakeHttpSessionAffinity is true, \
-                     but frontends.snowflakeHttp.sessionAffinityAcknowledged is false. \
-                     Wire sessions live in process memory; configure your load balancer for session affinity \
-                     to the same QueryFlux replica for all requests that reuse the Snowflake login token \
-                     (e.g. consistent hash on the Authorization header), then set sessionAffinityAcknowledged: true. \
-                     For a single-replica deployment, omit enforceSnowflakeHttpSessionAffinity."
-                );
-            }
-            tracing::info!(
-                "Snowflake HTTP frontend: login sessions are stored in this process only; \
-                 multi-replica setups require load balancer session affinity to the same instance per client token. \
-                 Set queryflux.enforceSnowflakeHttpSessionAffinity: true with sessionAffinityAcknowledged: true after configuring routing."
-            );
-        }
-    }
-
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
     let cluster_configs = config.clusters.clone();
 
@@ -714,14 +688,6 @@ async fn main() -> Result<()> {
     }));
     let live = Arc::new(tokio::sync::RwLock::new(live_config));
 
-    let snowflake_session_policy = config
-        .queryflux
-        .frontends
-        .snowflake_http
-        .as_ref()
-        .map(SnowflakeHttpSessionPolicy::from_frontend_config)
-        .unwrap_or_default();
-
     // Replica identity for capacity leases and queue claims. Must be unique per
     // *process incarnation*: PIDs collide across containers (the main process is
     // PID 1 in most pods), and a bare hostname survives container restarts —
@@ -781,7 +747,6 @@ async fn main() -> Result<()> {
         translation,
         metrics,
         identity_resolver,
-        snowflake_sessions: SnowflakeSessionStore::new(snowflake_session_policy),
         capacity_store,
         queue_coordinator,
         instance_id,

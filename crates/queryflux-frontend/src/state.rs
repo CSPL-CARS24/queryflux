@@ -22,7 +22,6 @@ use queryflux_persistence::{CapacityStore, Persistence, QueueCoordinator};
 use queryflux_routing::chain::{RouterChain, RoutingTrace};
 use queryflux_translation::TranslationService;
 
-use crate::snowflake::http::session_store::SnowflakeSessionStore;
 
 /// Everything that can be hot-reloaded from the DB without restarting the proxy.
 ///
@@ -76,8 +75,6 @@ pub struct AppState {
     pub metrics: Arc<dyn MetricsStore>,
     /// Resolves per-user `QueryCredentials` from `AuthContext` + cluster `queryAuth` config.
     pub identity_resolver: Arc<BackendIdentityResolver>,
-    /// Snowflake HTTP wire sessions (in-memory, process-local). See Snowflake frontend docs.
-    pub snowflake_sessions: Arc<SnowflakeSessionStore>,
     /// Global cluster capacity coordination — ensures `max_running_queries` is enforced
     /// across all replicas, not just per-process. `None` in InMemory mode (local atomics
     /// are the source of truth).
