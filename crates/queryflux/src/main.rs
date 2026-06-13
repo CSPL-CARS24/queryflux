@@ -472,6 +472,7 @@ async fn main() -> Result<()> {
         group_order.push(group_name.clone());
         group_states.insert(group_key, (states, strategy));
     }
+    group_order.sort();
 
     let health_check_targets = health_targets_from_groups(&group_states, &adapters);
     let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
@@ -1719,6 +1720,7 @@ async fn build_live_config(
         group_order.push(group_name.clone());
         group_states.insert(group_key, (states, strategy));
     }
+    group_order.sort();
 
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
     cache.cluster_states = health_check_targets

@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use queryflux_auth::{AuthContext, Credentials};
+use queryflux_auth::Credentials;
 use queryflux_core::{
     error::QueryFluxError,
     query::{BackendQueryId, FrontendProtocol, ProxyQueryId, QueryPollResult, QueryStatus},
@@ -409,21 +409,13 @@ pub async fn post_statement(
             .route_with_trace(&sql, &session, &protocol, Some(&auth_ctx))
             .await
     };
-    let (group, trace) = match routing_result {
+    let (group, _trace) = match routing_result {
         Ok(r) => r,
         Err(e) => {
             warn!("Routing error: {e}");
             let tmp_id = ProxyQueryId::new();
             return trino_error_response(&tmp_id.0, &format!("Routing error: {e}")).into_response();
         }
-    };
-
-    // 3. Authorization-aware first-fit when router chain fell back to static default.
-    // If the user is authorized for a more specific group, use it instead.
-    let group = if trace.used_fallback {
-        resolve_group_for_user(&state, &auth_ctx, group).await
-    } else {
-        group
     };
 
     let query_id = ProxyQueryId::new();
@@ -588,29 +580,6 @@ fn base64_decode(encoded: &str) -> Result<String, ()> {
         _ => {}
     }
     String::from_utf8(out).map_err(|_| ())
-}
-
-/// When the router chain fell back to the static default, check if the authenticated user
-/// is authorized for any specific group and return the first match.
-/// Falls back to the static `routingFallback` group if no authorized group found.
-async fn resolve_group_for_user(
-    state: &AppState,
-    auth_ctx: &AuthContext,
-    fallback: queryflux_core::query::ClusterGroupName,
-) -> queryflux_core::query::ClusterGroupName {
-    // Snapshot the group order and authorization checker under the read lock, then drop
-    // the lock before calling authorization.check (which may do async I/O, e.g. OpenFGA).
-    let (group_order, authorization) = {
-        let live = state.live.read().await;
-        (live.group_order.clone(), live.authorization.clone())
-    };
-    for group_name in &group_order {
-        let group = queryflux_core::query::ClusterGroupName(group_name.clone());
-        if authorization.check(auth_ctx, group_name).await {
-            return group;
-        }
-    }
-    fallback
 }
 
 /// GET /v1/statement/qf/queued/{id}/{seq} — poll a query queued in QueryFlux.
