@@ -121,19 +121,12 @@ pub async fn dispatch_query(
     sequence: u64,
     auth_ctx: &AuthContext,
 ) -> Result<DispatchOutcome> {
-    // Authorization check — first gate before any resource acquisition.
-    let authorization = state.live.read().await.authorization.clone();
-    if !authorization.check(auth_ctx, &group.0).await {
-        return Err(QueryFluxError::Unauthorized(format!(
-            "user '{}' is not authorized to run queries on cluster group '{}'",
-            auth_ctx.user, group.0
-        )));
-    }
-
-    // Clone the manager, group translation fixups, default tags, and guard chains in one snapshot.
-    let (cluster_manager, group_fixups, group_default_tags, guard_chain, group_guard_chain) = {
+    // Snapshot all live config fields in one lock acquisition. The guard is
+    // dropped before any await point so no lock is held during I/O.
+    let (authorization, cluster_manager, group_fixups, group_default_tags, guard_chain, group_guard_chain) = {
         let live = state.live.read().await;
         (
+            live.authorization.clone(),
             live.cluster_manager.clone(),
             live.group_translation_scripts
                 .get(&group.0)
@@ -147,6 +140,14 @@ pub async fn dispatch_query(
             live.group_guard_chains.get(&group.0).cloned(),
         )
     };
+
+    if !authorization.check(auth_ctx, &group.0).await {
+        return Err(QueryFluxError::Unauthorized(format!(
+            "user '{}' is not authorized to run queries on cluster group '{}'",
+            auth_ctx.user, group.0
+        )));
+    }
+
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
 
     // Admission fairness: don't take a slot that an older, actively-polling
@@ -1106,14 +1107,8 @@ async fn setup_sync_query(
         let live = state.live.read().await;
         (
             live.cluster_manager.clone(),
-            live.group_translation_scripts
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
-            live.group_default_tags
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
+            live.group_translation_scripts.get(&group.0).cloned().unwrap_or_default(),
+            live.group_default_tags.get(&group.0).cloned().unwrap_or_default(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1562,7 +1557,15 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    let authorization = state.live.read().await.authorization.clone();
+    let (authorization, guard_chain, group_guard_chain) = {
+        let live = state.live.read().await;
+        (
+            live.authorization.clone(),
+            live.guard_chain.clone(),
+            live.group_guard_chains.get(&group.0).cloned(),
+        )
+    };
+
     if !authorization.check(auth_ctx, &group.0).await {
         let msg = format!(
             "user '{}' is not authorized to run queries on cluster group '{}'",
@@ -1570,14 +1573,6 @@ pub async fn execute_to_sink(
         );
         return sink.on_error(&msg).await;
     }
-
-    let (guard_chain, group_guard_chain) = {
-        let live = state.live.read().await;
-        (
-            live.guard_chain.clone(),
-            live.group_guard_chains.get(&group.0).cloned(),
-        )
-    };
 
     let mut setup = match setup_sync_query(
         state,

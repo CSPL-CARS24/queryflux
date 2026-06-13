@@ -750,6 +750,15 @@ async fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    if distributed {
+        tracing::warn!(
+            "Distributed coordination is enabled. \
+             This requires HA Postgres — during a Postgres outage the fleet reverts to \
+             per-replica capacity limits (group_limit × replicas worst case). \
+             Alert on queryflux_coordination_failures_total > 0."
+        );
+    }
+
     let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
         .then(|| {
             distributed_backend
