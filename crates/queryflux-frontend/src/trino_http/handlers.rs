@@ -784,7 +784,7 @@ pub async fn get_queued_statement(
 /// then `/v1/statement/executing/...` once running. Both are handled identically here.
 ///
 /// The path is embedded verbatim in the client-facing URL. Any QueryFlux instance looks up
-/// the stored `trino_endpoint` by trino_id (second path segment) and reconstructs the full
+/// the stored `poll_base_url` by trino_id (second path segment) and reconstructs the full
 /// Trino URL — no persistence write needed between polls.
 pub async fn get_executing_statement(
     State(state): State<Arc<AppState>>,
@@ -849,10 +849,10 @@ pub async fn get_executing_statement(
         }
     };
 
-    // Reconstruct the full Trino poll URL: stored endpoint + /v1/statement/ + captured path.
+    // Reconstruct the full Trino poll URL: stored base URL + /v1/statement/ + captured path.
     let trino_url = format!(
         "{}/v1/statement/{}",
-        executing.trino_endpoint.trim_end_matches('/'),
+        executing.poll_base_url.as_deref().unwrap_or_default().trim_end_matches('/'),
         trino_path
     );
 
@@ -941,10 +941,10 @@ pub async fn get_executing_statement(
     match poll_result {
         QueryPollResult::Raw {
             body,
-            next_uri,
+            poll_token,
             engine_stats,
         } => {
-            if next_uri.is_none() {
+            if poll_token.is_none() {
                 // Final page — query complete.
                 state.record_query(
                     &ctx,
@@ -974,7 +974,7 @@ pub async fn get_executing_statement(
             }
 
             // Intermediate page — rewrite nextUri (swap Trino host → QueryFlux), no persistence write.
-            let proxy_next_uri = next_uri
+            let proxy_next_uri = poll_token
                 .as_deref()
                 .map(|uri| rewrite_trino_uri(uri, &state.external_address));
             raw_response_with_rewritten_next_uri(body, proxy_next_uri).into_response()
@@ -1034,9 +1034,9 @@ pub async fn get_executing_statement(
             json_response(&error_resp).into_response()
         }
 
-        QueryPollResult::Pending { next_uri, .. } => {
-            // Still running — rewrite nextUri, no persistence write needed.
-            let proxy_next_uri = next_uri
+        QueryPollResult::Pending { poll_token, .. } => {
+            // Still running — rewrite poll URL, no persistence write needed.
+            let proxy_next_uri = poll_token
                 .as_deref()
                 .map(|uri| rewrite_trino_uri(uri, &state.external_address))
                 .unwrap_or_else(|| {
@@ -1062,7 +1062,7 @@ pub async fn delete_executing_statement(
     if let Ok(Some(executing)) = state.persistence.get(&backend_id).await {
         let trino_url = format!(
             "{}/v1/statement/{}",
-            executing.trino_endpoint.trim_end_matches('/'),
+            executing.poll_base_url.as_deref().unwrap_or_default().trim_end_matches('/'),
             trino_path
         );
         let client = reqwest::Client::new();

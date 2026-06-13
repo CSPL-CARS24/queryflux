@@ -15,12 +15,11 @@ use queryflux_core::tags::{merge_tags, QueryTags};
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
-        ClusterGroupName, ClusterName, EngineType, ExecutingQuery, FrontendProtocol, ProxyQueryId,
+        ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol, ProxyQueryId,
         QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery,
     },
     session::SessionContext,
 };
-use queryflux_engine_adapters::trino::api::TrinoResponse;
 use queryflux_engine_adapters::{AdapterKind, AsyncAdapter, ConnectionFormat, SyncAdapter};
 use queryflux_guardrails::{GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
@@ -79,7 +78,7 @@ pub enum DispatchOutcome {
 /// `http://queryflux:9000/v1/statement/executing/{id}/{token}`
 ///
 /// Any instance can then reconstruct the Trino URL by looking up the stored
-/// `trino_endpoint` and re-joining it with the path.
+/// `poll_base_url` and re-joining it with the path extracted from the client request.
 async fn cluster_db_ids(
     mgr: &std::sync::Arc<dyn ClusterGroupManager>,
     group: &ClusterGroupName,
@@ -406,11 +405,11 @@ pub async fn dispatch_query(
                 let _ = state.persistence.delete_queued(&query_id).await;
             }
 
-            let QueryExecution::Async {
-                backend_query_id,
-                next_uri,
-                initial_body,
-            } = execution;
+            // Extract backend_query_id first so we can build ExecutingQuery before branching.
+            let backend_query_id = match &execution {
+                QueryExecution::Running { backend_query_id, .. } => backend_query_id.clone(),
+                QueryExecution::Completed { backend_query_id, .. } => backend_query_id.clone(),
+            };
             let now = Utc::now();
             let executing = ExecutingQuery {
                 id: query_id.clone(),
@@ -425,7 +424,7 @@ pub async fn dispatch_query(
                 cluster_group_config_id,
                 cluster_config_id,
                 backend_query_id: backend_query_id.clone(),
-                trino_endpoint: adapter.base_url().to_string(),
+                poll_base_url: Some(adapter.base_url().to_string()),
                 creation_time: now,
                 last_accessed: now,
                 query_tags: effective_tags,
@@ -433,325 +432,144 @@ pub async fn dispatch_query(
                 submitted_guard_actions,
                 was_guard_blocked: false,
             };
-            // Slot ownership transfers to the executing record: poll, cancel,
-            // and zombie-eviction paths release it from here on. If the record
-            // can't be persisted, cancel the engine-side query best-effort so
-            // it doesn't burn cluster resources invisibly, then release the slot.
-            if let Err(e) = state.persistence.upsert(executing.clone()).await {
-                warn!(id = %query_id, "Failed to persist executing query: {e}");
-                let cancel_adapter = adapter.clone();
-                let cancel_id = backend_query_id.clone();
-                tokio::spawn(async move {
-                    if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
-                        warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
-                    }
-                });
-                slot.release().await;
-                return Err(QueryFluxError::Persistence(format!(
-                    "persist executing query: {e}"
-                )));
-            }
-            slot.disarm();
-            info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
 
-            if next_uri.is_none() {
-                if let Some(ref ib) = initial_body {
-                    if engine_type == EngineType::Trino {
-                        finalize_trino_async_terminal_on_submit(
-                            state, &executing, &adapter, &session, protocol, ib,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            let proxy_next_uri = next_uri
-                .as_deref()
-                .map(|uri| rewrite_trino_uri(uri, &state.external_address));
-            Ok(DispatchOutcome::Async {
-                initial_body,
-                proxy_next_uri,
-            })
-        }
-        AdapterKind::Sync(sync_adapter) => {
-            if already_queued {
-                let _ = state.persistence.delete_queued(&query_id).await;
-            }
-
-            info!(id = %query_id, cluster = %cluster_name, "Query executing (sync via dispatch)");
-            let start = Instant::now();
-
-            let mut sink = crate::trino_http::result_sink::TrinoHttpResultSink::new(&query_id.0);
-
-            debug!(id = %query_id, "sync dispatch: calling execute_as_arrow");
-            let (status, rows, error) = match sync_adapter
-                .execute_as_arrow(
-                    &sql,
-                    &session,
-                    &credentials,
-                    &effective_tags,
-                    &effective_params,
-                )
-                .await
-            {
-                Ok(execution) => {
-                    debug!(id = %query_id, "sync dispatch: execute_as_arrow returned stream");
-                    let mut stream = execution.stream;
-                    let mut schema_sent = false;
-                    let mut total_rows: u64 = 0;
-                    let mut stream_err: Option<String> = None;
-                    let mut batch_count: u64 = 0;
-
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(batch) => {
-                                if !schema_sent {
-                                    debug!(id = %query_id, cols = batch.num_columns(), "sync dispatch: on_schema");
-                                    let _ = sink.on_schema(batch.schema_ref()).await;
-                                    schema_sent = true;
-                                }
-                                total_rows += batch.num_rows() as u64;
-                                batch_count += 1;
-                                debug!(id = %query_id, batch = batch_count, rows = batch.num_rows(), "sync dispatch: on_batch");
-                                let _ = sink.on_batch(&batch).await;
-                                debug!(id = %query_id, batch = batch_count, "sync dispatch: on_batch done");
+            match execution {
+                QueryExecution::Running {
+                    poll_token,
+                    initial_response,
+                    ..
+                } => {
+                    // Slot ownership transfers to the executing record: poll, cancel,
+                    // and zombie-eviction paths release it from here on. If the record
+                    // can't be persisted, cancel the engine-side query best-effort so
+                    // it doesn't burn cluster resources invisibly, then release the slot.
+                    if let Err(e) = state.persistence.upsert(executing.clone()).await {
+                        warn!(id = %query_id, "Failed to persist executing query: {e}");
+                        let cancel_adapter = adapter.clone();
+                        let cancel_id = backend_query_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
+                                warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
                             }
-                            Err(e) => {
-                                stream_err = Some(e.to_string());
-                                let _ = sink.on_error(stream_err.as_ref().unwrap()).await;
-                                break;
-                            }
-                        }
+                        });
+                        slot.release().await;
+                        return Err(QueryFluxError::Persistence(format!(
+                            "persist executing query: {e}"
+                        )));
                     }
+                    slot.disarm();
+                    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
 
-                    if !schema_sent {
-                        debug!(id = %query_id, "sync dispatch: empty schema");
-                        let _ = sink.on_schema(&Schema::empty()).await;
-                    }
-
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let stats = QueryStats {
-                        execution_duration_ms: elapsed_ms,
-                        rows_returned: total_rows,
-                        ..Default::default()
-                    };
-                    debug!(id = %query_id, total_rows, "sync dispatch: on_complete");
-                    let _ = sink.on_complete(&stats).await;
-
-                    if let Some(err_msg) = stream_err {
-                        (QueryStatus::Failed, None, Some(err_msg))
-                    } else {
-                        (QueryStatus::Success, Some(total_rows), None)
-                    }
+                    let proxy_next_uri = poll_token
+                        .as_deref()
+                        .map(|uri| rewrite_trino_uri(uri, &state.external_address));
+                    Ok(DispatchOutcome::Async {
+                        initial_body: initial_response,
+                        proxy_next_uri,
+                    })
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    warn!(id = %query_id, cluster = %cluster_name, "Sync execute_as_arrow failed: {msg}");
-                    let _ = sink.on_error(&msg).await;
-                    (QueryStatus::Failed, None, Some(msg))
-                }
-            };
-
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-
-            let ctx = QueryContext {
-                query_id,
-                sql: original_sql,
-                session,
-                protocol,
-                group: group.clone(),
-                cluster: cluster_name.clone(),
-                cluster_group_config_id,
-                cluster_config_id,
-                engine_type,
-                src_dialect,
-                tgt_dialect,
-                was_translated,
-                translated_sql: if was_translated { Some(sql) } else { None },
-                query_tags: effective_tags,
-                query_params: effective_params,
-                agent_context: resolved_agent_ctx,
-            };
-            state.record_query(
-                &ctx,
-                QueryOutcome {
-                    backend_query_id: None,
+                QueryExecution::Completed {
                     status,
-                    execution_ms: elapsed_ms,
-                    rows,
                     error,
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: all_guard_actions,
-                    was_guard_blocked: false,
-                },
-            );
-
-            slot.release().await;
-
-            debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
-            let body_bytes = sink.into_bytes();
-            debug!(id = %ctx.query_id, bytes = body_bytes.len(), "sync dispatch: into_bytes done");
-            Ok(DispatchOutcome::Async {
-                initial_body: Some(body_bytes),
-                proxy_next_uri: None,
-            })
-        }
-    }
-}
-
-/// Determine the terminal `QueryOutcome` from a Trino submit response body.
-///
-/// Parses the body to determine success vs failure. `engine_stats` is passed in
-/// from `adapter.terminal_stats_from_body()` — Trino-specific stats parsing lives
-/// in the adapter, not here.
-///
-/// Returns `(outcome, Option<warn_log_message>)`.
-fn trino_submit_terminal_outcome(
-    body: &Bytes,
-    elapsed_ms: u64,
-    backend_id: String,
-    engine_stats: Option<QueryEngineStats>,
-) -> (QueryOutcome, Option<String>) {
-    let trino_resp: TrinoResponse = match serde_json::from_slice(body.as_ref()) {
-        Ok(r) => r,
-        Err(e) => {
-            let warn_msg = format!(
-                "trino submit terminal body JSON parse failed: {e}; releasing cluster + clearing persistence"
-            );
-            return (
-                QueryOutcome {
-                    backend_query_id: Some(backend_id),
-                    status: QueryStatus::Failed,
-                    execution_ms: elapsed_ms,
-                    rows: None,
-                    error: Some(format!("failed to parse Trino response: {e}")),
-                    routing_trace: None,
                     engine_stats,
-                    guard_actions: vec![],
-                    was_guard_blocked: false,
-                },
-                Some(warn_msg),
-            );
+                    initial_response,
+                    ..
+                } => {
+                    // Query finished on the initial submit — no poll handler will be called.
+                    // Disarm the RAII guard; finalize will call release_query_slot explicitly.
+                    slot.disarm();
+                    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query completed on submit");
+                    let was_translated = executing.translated_sql.is_some();
+                    let src_dialect = protocol.default_dialect();
+                    let ctx = QueryContext {
+                        query_id: executing.id.clone(),
+                        sql: executing
+                            .translated_sql
+                            .as_deref()
+                            .unwrap_or(&executing.sql)
+                            .to_string(),
+                        session: session.clone(),
+                        protocol,
+                        group: executing.cluster_group.clone(),
+                        cluster: executing.cluster_name.clone(),
+                        cluster_group_config_id: executing.cluster_group_config_id,
+                        cluster_config_id: executing.cluster_config_id,
+                        engine_type: adapter.engine_type(),
+                        src_dialect,
+                        tgt_dialect: adapter.translation_target_dialect(),
+                        was_translated,
+                        translated_sql: if was_translated {
+                            Some(executing.sql.clone())
+                        } else {
+                            None
+                        },
+                        query_tags: executing.query_tags.clone(),
+                        query_params: vec![],
+                        agent_context: executing.agent_context.clone(),
+                    };
+                    finalize_async_terminal_on_submit(
+                        state, &executing, ctx, status, error, engine_stats,
+                    )
+                    .await;
+                    Ok(DispatchOutcome::Async {
+                        initial_body: initial_response,
+                        proxy_next_uri: None,
+                    })
+                }
+            }
         }
-    };
-
-    let backend_id = Some(backend_id);
-
-    if let Some(err) = &trino_resp.error {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Failed,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: Some(err.message.clone()),
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    } else if trino_resp.stats.state == "FAILED" {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Failed,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: Some("Trino query FAILED".to_string()),
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    } else {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Success,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: None,
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
+        AdapterKind::Sync(_) => {
+            // dispatch_query is the async path only. A sync cluster selected by
+            // round-robin in a mixed group signals the caller to retry via
+            // execute_to_sink, which will drive its own slot acquisition loop.
+            slot.release().await;
+            Err(QueryFluxError::SyncEngineRequired(
+                cluster_name.0.clone(),
+            ))
+        }
     }
 }
 
-/// Trino may return `FINISHED` with no `nextUri` on the initial POST `/v1/statement` response.
-/// Clients then never call GET `/v1/statement/...`, so `get_executing_statement` never runs —
-/// mirror its metrics, `record_query`, and persistence cleanup here.
-///
-/// Collapsed from 4 branches (including JSON parse error) to a single `record_query` call.
-async fn finalize_trino_async_terminal_on_submit(
+/// Called when `submit_query` returns `QueryExecution::Completed` — the adapter
+/// signalled the query is done on the initial POST (fast queries, immediate errors).
+/// Handles the protocol-neutral record/release/cleanup that the poll handler would
+/// otherwise perform, since no poll request will ever arrive for this query.
+async fn finalize_async_terminal_on_submit(
     state: &Arc<AppState>,
     executing: &ExecutingQuery,
-    adapter: &Arc<dyn AsyncAdapter>,
-    session: &SessionContext,
-    protocol: FrontendProtocol,
-    body: &Bytes,
+    ctx: QueryContext,
+    status: QueryStatus,
+    error: Option<String>,
+    engine_stats: Option<QueryEngineStats>,
 ) {
     let elapsed_ms = (Utc::now() - executing.creation_time)
         .num_milliseconds()
         .max(0) as u64;
 
-    let was_translated = executing.translated_sql.is_some();
-    let src_dialect = protocol.default_dialect();
-    let ctx = QueryContext {
-        query_id: executing.id.clone(),
-        sql: executing
-            .translated_sql
-            .as_deref()
-            .unwrap_or(&executing.sql)
-            .to_string(),
-        session: session.clone(),
-        protocol,
-        group: executing.cluster_group.clone(),
-        cluster: executing.cluster_name.clone(),
-        cluster_group_config_id: executing.cluster_group_config_id,
-        cluster_config_id: executing.cluster_config_id,
-        engine_type: adapter.engine_type(),
-        src_dialect,
-        tgt_dialect: adapter.translation_target_dialect(),
-        was_translated,
-        translated_sql: if was_translated {
-            Some(executing.sql.clone())
-        } else {
-            None
-        },
-        query_tags: executing.query_tags.clone(),
-        query_params: vec![],
-        agent_context: executing.agent_context.clone(),
+    let stored_actions: Vec<queryflux_persistence::GuardAction> = match serde_json::from_value(
+        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
+    ) {
+        Ok(actions) => actions,
+        Err(e) => {
+            warn!(id = %executing.id, "Failed to deserialize stored guard actions: {e}");
+            vec![]
+        }
     };
 
-    let engine_stats = adapter.terminal_stats_from_body(body);
-    let (mut outcome, warn_msg) = trino_submit_terminal_outcome(
-        body,
-        elapsed_ms,
-        executing.backend_query_id.0.clone(),
+    let mut outcome = QueryOutcome {
+        backend_query_id: Some(executing.backend_query_id.0.clone()),
+        status,
+        execution_ms: elapsed_ms,
+        rows: None,
+        error,
+        routing_trace: None,
         engine_stats,
-    );
-
-    // Inject guard actions captured at submit time into the final audit record.
-    let stored_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
-        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
-    )
-    .unwrap_or_default();
+        guard_actions: vec![],
+        was_guard_blocked: false,
+    };
     if !stored_actions.is_empty() {
         outcome.guard_actions = stored_actions;
         outcome.was_guard_blocked = executing.was_guard_blocked;
-    }
-
-    if let Some(msg) = warn_msg {
-        warn!(proxy_id = %executing.id, "{msg}");
     }
 
     state.record_query(&ctx, outcome);
@@ -762,7 +580,9 @@ async fn finalize_trino_async_terminal_on_submit(
             &executing.id.0,
         )
         .await;
-    let _ = state.persistence.delete(&executing.backend_query_id).await;
+    if let Err(e) = state.persistence.delete(&executing.backend_query_id).await {
+        warn!(id = %executing.id, "Failed to delete executing record on terminal submit: {e}");
+    }
 }
 
 /// Effective `max_running_queries` for a cluster, as resolved in the hot-reloaded
