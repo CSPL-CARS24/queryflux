@@ -11,7 +11,7 @@
 //! Results are streamed as Arrow RecordBatches and serialised to Postgres text format.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow::array::Array;
@@ -56,11 +56,16 @@ static CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 pub struct PostgresWireFrontend {
     state: Arc<AppState>,
     port: u16,
+    max_connections: Option<usize>,
 }
 
 impl PostgresWireFrontend {
-    pub fn new(state: Arc<AppState>, port: u16) -> Self {
-        Self { state, port }
+    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
+        Self {
+            state,
+            port,
+            max_connections,
+        }
     }
 }
 
@@ -73,17 +78,30 @@ impl FrontendListenerTrait for PostgresWireFrontend {
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))?;
 
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_conn = self.max_connections.filter(|&l| l > 0);
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let (stream, peer) = result.map_err(|e| QueryFluxError::Other(e.into()))?;
+                    if let Some(limit) = max_conn {
+                        if active.load(Ordering::Relaxed) >= limit {
+                            tracing::warn!(peer = %peer, "Postgres wire: rejecting connection — at limit {limit}");
+                            drop(stream);
+                            continue;
+                        }
+                    }
                     debug!(peer = %peer, "Postgres wire: new connection");
                     let state = self.state.clone();
                     let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                    let active = active.clone();
+                    active.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, state, conn_id).await {
                             debug!(conn_id, "Postgres wire connection closed: {e}");
                         }
+                        active.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 _ = shutdown.changed() => {

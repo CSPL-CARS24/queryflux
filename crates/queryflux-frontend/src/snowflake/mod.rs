@@ -19,15 +19,25 @@ use crate::{FrontendListenerTrait, ShutdownRx};
 pub struct SnowflakeFrontend {
     state: Arc<AppState>,
     port: u16,
+    max_connections: Option<usize>,
 }
 
 impl SnowflakeFrontend {
-    pub fn new(state: Arc<AppState>, port: u16) -> Self {
-        Self { state, port }
+    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
+        Self {
+            state,
+            port,
+            max_connections,
+        }
     }
 
     pub fn router(&self) -> Router {
-        sql_api::routes().with_state(self.state.clone())
+        let router = sql_api::routes().with_state(self.state.clone());
+        if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
+            router.layer(tower::limit::ConcurrencyLimitLayer::new(limit))
+        } else {
+            router
+        }
     }
 }
 

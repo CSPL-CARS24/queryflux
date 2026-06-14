@@ -70,16 +70,39 @@ impl PostgresStore {
         Self::connect_with_pool_size(database_url, None).await
     }
 
-    /// Connect with an explicit pool size. `None` keeps the sqlx default (10).
+    /// Connect with explicit pool tuning. `None` values keep sqlx defaults.
     /// The pool serves the dispatch hot path (capacity acquire/release per
     /// query) plus persistence, admin, LISTEN/NOTIFY, and sweep connections.
     pub async fn connect_with_pool_size(
         database_url: &str,
         max_connections: Option<u32>,
     ) -> Result<Self> {
+        Self::connect_with_pool_opts(database_url, max_connections, None, None).await
+    }
+
+    pub async fn connect_with_pool_opts(
+        database_url: &str,
+        max_connections: Option<u32>,
+        acquire_timeout_secs: Option<u64>,
+        statement_timeout_secs: Option<u64>,
+    ) -> Result<Self> {
         let mut opts = sqlx::postgres::PgPoolOptions::new();
         if let Some(n) = max_connections {
             opts = opts.max_connections(n);
+        }
+        let timeout = std::time::Duration::from_secs(acquire_timeout_secs.unwrap_or(30));
+        opts = opts.acquire_timeout(timeout);
+
+        if let Some(stmt_secs) = statement_timeout_secs {
+            let stmt_ms = stmt_secs.saturating_mul(1000);
+            opts = opts.after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    conn.execute(format!("SET statement_timeout = {stmt_ms}").as_str())
+                        .await?;
+                    Ok(())
+                })
+            });
         }
         let pool = opts.connect(database_url).await.map_err(|e| {
             QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}"))

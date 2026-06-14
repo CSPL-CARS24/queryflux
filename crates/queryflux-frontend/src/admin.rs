@@ -22,7 +22,7 @@ use queryflux_core::{
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
     cluster_config::{
-        ClusterGroupConfigRecord, RenameConfigRequest, UpsertClusterConfig,
+        ClusterConfigRecord, ClusterGroupConfigRecord, RenameConfigRequest, UpsertClusterConfig,
         UpsertClusterGroupConfig,
     },
     query_history::{
@@ -550,6 +550,7 @@ impl AdminFrontend {
         let public = Router::new()
             .route("/health", get(health_handler))
             .route("/readyz", get(readiness_handler))
+            // SECURITY: /metrics should be network-restricted in production (firewall or separate listener)
             .route("/metrics", get(metrics_handler))
             .route(
                 "/openapi.json",
@@ -841,9 +842,13 @@ async fn readiness_handler(State(state): State<Arc<AdminState>>) -> impl IntoRes
         return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
     }
     let cm = live.cluster_manager.clone();
+    drop(live);
+
     match cm.all_cluster_states().await {
-        Ok(states) if !states.is_empty() => (StatusCode::OK, "ready").into_response(),
-        Ok(_) => (StatusCode::SERVICE_UNAVAILABLE, "no cluster groups").into_response(),
+        Ok(states) if states.is_empty() => {
+            (StatusCode::SERVICE_UNAVAILABLE, "no cluster groups").into_response()
+        }
+        Ok(_) => (StatusCode::OK, "ready").into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "cluster manager error").into_response(),
     }
 }
@@ -1222,6 +1227,39 @@ async fn update_cluster_handler(
 // Persisted cluster config CRUD
 // ---------------------------------------------------------------------------
 
+/// Redact sensitive fields from a cluster config JSON value in-place.
+fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
+    if let Some(obj) = config.as_object_mut() {
+        for key in [
+            "authPassword",
+            "password",
+            "authToken",
+            "awsSecretAccessKey",
+            "secretAccessKey",
+            "token",
+        ] {
+            if obj.contains_key(key) {
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Value::String("***REDACTED***".to_string()),
+                );
+            }
+        }
+        for (_, val) in obj.iter_mut() {
+            if val.is_object() {
+                redact_cluster_config_secrets(val);
+            }
+        }
+    }
+}
+
+/// Clone a `ClusterConfigRecord` with secrets redacted from the `config` field.
+fn redacted_cluster_config(record: ClusterConfigRecord) -> ClusterConfigRecord {
+    let mut record = record;
+    redact_cluster_config_secrets(&mut record.config);
+    record
+}
+
 macro_rules! require_store {
     ($state:expr) => {
         match &$state.admin_store {
@@ -1282,7 +1320,11 @@ fn rename_persistence_error_status(e: &queryflux_core::error::QueryFluxError) ->
 async fn list_cluster_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let pg = require_store!(state);
     match pg.list_cluster_configs().await {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => {
+            let redacted: Vec<ClusterConfigRecord> =
+                rows.into_iter().map(redacted_cluster_config).collect();
+            Json(redacted).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -1306,7 +1348,7 @@ async fn get_cluster_config_handler(
 ) -> impl IntoResponse {
     let pg = require_store!(state);
     match pg.get_cluster_config(&name).await {
-        Ok(Some(r)) => Json(r).into_response(),
+        Ok(Some(r)) => Json(redacted_cluster_config(r)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1334,7 +1376,7 @@ async fn upsert_cluster_config_handler(
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
-            Json(r).into_response()
+            Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1363,7 +1405,7 @@ async fn rename_cluster_config_handler(
     match pg.rename_cluster_config(&name, &body.new_name).await {
         Ok(r) => {
             notify_live_config_reload(&state);
-            Json(r).into_response()
+            Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
     }

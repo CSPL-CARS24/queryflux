@@ -62,20 +62,61 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "queryflux=info,queryflux_frontend=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
 
-    info!("QueryFlux starting — loading config from: {}", cli.config);
+    // Load config before initializing the tracing subscriber so that
+    // `otlpEndpoint` from the config file can feed the OTel layer.
     let mut config = YamlFileConfigProvider::new(&cli.config)
         .load()
         .await
         .context("Failed to load config")?;
+
+    // Initialize tracing subscriber — with OTel if configured.
+    {
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "queryflux=info,queryflux_frontend=info".into());
+
+        #[cfg(feature = "otlp")]
+        {
+            if let Some(endpoint) = &config.queryflux.otlp_endpoint {
+                use opentelemetry::trace::TracerProvider;
+                use opentelemetry_otlp::WithExportConfig;
+                use tracing_subscriber::layer::SubscriberExt;
+                use tracing_subscriber::util::SubscriberInitExt;
+
+                let exporter = opentelemetry_otlp::SpanExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .expect("Failed to create OTLP exporter");
+                let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name("queryflux")
+                            .build(),
+                    )
+                    .build();
+                let telemetry =
+                    tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("queryflux"));
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer())
+                    .with(telemetry)
+                    .init();
+                tracing::info!(endpoint = %endpoint, "OpenTelemetry OTLP tracing enabled");
+            } else {
+                tracing_subscriber::fmt().with_env_filter(env_filter).init();
+            }
+        }
+
+        #[cfg(not(feature = "otlp"))]
+        {
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        }
+    }
+
+    info!("QueryFlux starting — loaded config from: {}", cli.config);
 
     let external_address = config
         .queryflux
@@ -105,9 +146,14 @@ async fn main() -> Result<()> {
                 .connection_url()
                 .map_err(|m| anyhow::anyhow!("Invalid postgres persistence config: {m}"))?;
             let pg = Arc::new(
-                PostgresStore::connect_with_pool_size(&url, conn.pool_size)
-                    .await
-                    .context("Failed to connect to Postgres")?,
+                PostgresStore::connect_with_pool_opts(
+                    &url,
+                    conn.pool_size,
+                    conn.acquire_timeout_secs,
+                    conn.statement_timeout_secs,
+                )
+                .await
+                .context("Failed to connect to Postgres")?,
             );
             pg.migrate().await.context("Migration failed")?;
             let buffered = Arc::new(BufferedMetricsStore::new(
@@ -571,6 +617,35 @@ async fn main() -> Result<()> {
     let auth_provider = build_auth_provider(&config.auth)?;
     let authorization = build_authorization(&config.authorization, &config.cluster_groups)?;
 
+    // --- Production safety warnings ---
+    if matches!(
+        config.auth.provider,
+        queryflux_core::config::AuthProviderConfig::None
+    ) {
+        tracing::warn!(
+            "SECURITY: auth.provider is 'none' — all query frontends accept unauthenticated traffic. \
+             Set auth.provider to 'oidc', 'ldap', or 'static' and auth.required = true for production."
+        );
+    }
+    if !config.auth.required {
+        tracing::warn!(
+            "SECURITY: auth.required is false — unauthenticated requests are allowed even when \
+             an auth provider is configured. Set auth.required = true for production."
+        );
+    }
+    {
+        let effective_user = std::env::var("QUERYFLUX_ADMIN_USER")
+            .unwrap_or_else(|_| config.queryflux.admin_api.username.clone());
+        let effective_pass = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| config.queryflux.admin_api.password.clone());
+        if effective_user == "admin" && effective_pass == "admin" {
+            tracing::warn!(
+                "SECURITY: admin API is using default credentials (admin/admin). \
+                 Change via QUERYFLUX_ADMIN_USER / QUERYFLUX_ADMIN_PASSWORD or the Studio UI."
+            );
+        }
+    }
+
     // --- Startup validation: impersonate only valid for Trino ---
     for (name, cfg) in &config.clusters {
         if matches!(
@@ -852,7 +927,11 @@ async fn main() -> Result<()> {
 
     // --- Start Trino HTTP frontend ---
     let trino_port = config.queryflux.frontends.trino_http.port;
-    let frontend = TrinoHttpFrontend::new(app_state.clone(), trino_port);
+    let frontend = TrinoHttpFrontend::new(
+        app_state.clone(),
+        trino_port,
+        config.queryflux.frontends.trino_http.max_connections,
+    );
 
     info!(
         "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
@@ -1040,6 +1119,22 @@ async fn main() -> Result<()> {
                             last_accessed = %q.last_accessed,
                             "Evicting zombie executing query — not polled for >5 min"
                         );
+
+                        // Best-effort cancel on the backend engine so the query
+                        // doesn't keep consuming cluster resources.
+                        if let Some(base_url) = &q.poll_base_url {
+                            let cancel_url =
+                                format!("{base_url}/v1/statement/executing/{}", q.backend_query_id);
+                            let client = state.http_client.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = client.delete(&cancel_url).send().await {
+                                    tracing::debug!(
+                                        "Zombie cancel request failed (best-effort): {e}"
+                                    );
+                                }
+                            });
+                        }
+
                         state
                             .metrics
                             .on_query_finished(&q.cluster_group.0, &q.cluster_name.0);
@@ -1394,7 +1489,11 @@ async fn main() -> Result<()> {
         let cfg = config.queryflux.frontends.mysql_wire.clone();
         async move {
             match cfg {
-                Some(c) if c.enabled => MysqlWireFrontend::new(state, c.port).listen(rx).await,
+                Some(c) if c.enabled => {
+                    MysqlWireFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
                 _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
         }
@@ -1405,7 +1504,11 @@ async fn main() -> Result<()> {
         let cfg = config.queryflux.frontends.postgres_wire.clone();
         async move {
             match cfg {
-                Some(c) if c.enabled => PostgresWireFrontend::new(state, c.port).listen(rx).await,
+                Some(c) if c.enabled => {
+                    PostgresWireFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
                 _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
         }
@@ -1416,7 +1519,11 @@ async fn main() -> Result<()> {
         let cfg = config.queryflux.frontends.flight_sql.clone();
         async move {
             match cfg {
-                Some(c) if c.enabled => FlightSqlFrontend::new(state, c.port).listen(rx).await,
+                Some(c) if c.enabled => {
+                    FlightSqlFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
                 _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
         }
@@ -1427,7 +1534,11 @@ async fn main() -> Result<()> {
         let cfg = config.queryflux.frontends.snowflake_http.clone();
         async move {
             match cfg {
-                Some(c) if c.enabled => SnowflakeFrontend::new(state, c.port).listen(rx).await,
+                Some(c) if c.enabled => {
+                    SnowflakeFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
                 _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
         }

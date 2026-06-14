@@ -50,11 +50,16 @@ use crate::{FrontendListenerTrait, ShutdownRx};
 pub struct FlightSqlFrontend {
     state: Arc<AppState>,
     port: u16,
+    max_connections: Option<usize>,
 }
 
 impl FlightSqlFrontend {
-    pub fn new(state: Arc<AppState>, port: u16) -> Self {
-        Self { state, port }
+    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
+        Self {
+            state,
+            port,
+            max_connections,
+        }
     }
 }
 
@@ -70,7 +75,11 @@ impl FrontendListenerTrait for FlightSqlFrontend {
         let service = QueryFluxFlightSql::new(self.state.clone());
         let flight_server = FlightServiceServer::new(service);
 
-        tonic::transport::Server::builder()
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
+            builder = builder.concurrency_limit_per_connection(limit);
+        }
+        builder
             .add_service(flight_server)
             .serve_with_shutdown(addr, async move {
                 let _ = shutdown.changed().await;

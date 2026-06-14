@@ -131,4 +131,11 @@ pub trait MetricsStore: Send + Sync {
     /// is not enforced for this admit. A sustained rate indicates the coordination
     /// backend is degraded; pair with `coordination_failures_total` alerts.
     fn on_capacity_degraded(&self, _cluster_group: &str, _cluster_name: &str) {}
+
+    /// Called when an authentication attempt fails (wrong password, expired token, etc.).
+    /// A sustained spike can indicate a credential-stuffing attack.
+    fn on_auth_failure(&self, _protocol: &str) {}
+
+    /// Called when a queue admission is rejected because `maxQueuedQueries` was reached.
+    fn on_queue_full(&self, _cluster_group: &str) {}
 }

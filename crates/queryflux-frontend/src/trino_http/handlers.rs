@@ -20,7 +20,7 @@ use queryflux_engine_adapters::trino::api::{
     queued_response, TrinoError, TrinoResponse, TrinoStats,
 };
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::result_sink::TrinoHttpResultSink;
 use crate::dispatch::{dispatch_query, execute_to_sink, rewrite_trino_uri, DispatchOutcome};
@@ -52,6 +52,20 @@ fn trino_error_response(query_id: &str, message: &str) -> Response<Body> {
         warnings: vec![],
     };
     json_response(&resp)
+}
+
+/// Returns a client-safe error message for the given error, or an empty string
+/// if the original message is already safe to expose (e.g. auth/not-found errors).
+fn client_safe_message(e: &QueryFluxError) -> &'static str {
+    use queryflux_core::error::QueryFluxError::*;
+    match e {
+        Persistence(_) => "Internal service error",
+        Engine(_) => "Backend engine error",
+        Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
+        Config(_) => "Configuration error",
+        Auth(_) | Unauthorized(_) | QueryNotFound(_) | ClusterNotFound(_) => "",
+        _ => "Internal error",
+    }
 }
 
 fn json_response(body: impl serde::Serialize) -> Response<Body> {
@@ -414,7 +428,14 @@ pub async fn post_statement(
         Err(e) => {
             warn!("Routing error: {e}");
             let tmp_id = ProxyQueryId::new();
-            return trino_error_response(&tmp_id.0, &format!("Routing error: {e}")).into_response();
+            let safe = client_safe_message(&e);
+            let fallback = e.to_string();
+            let msg = if safe.is_empty() {
+                fallback.as_str()
+            } else {
+                safe
+            };
+            return trino_error_response(&tmp_id.0, msg).into_response();
         }
     };
 
@@ -468,7 +489,13 @@ pub async fn post_statement(
             }
             Err(e) => {
                 warn!(id = %query_id, "Dispatch error: {e}");
-                trino_error_response(&query_id.0, &e.to_string()).into_response()
+                let msg = client_safe_message(&e);
+                let msg = if msg.is_empty() {
+                    e.to_string()
+                } else {
+                    msg.to_string()
+                };
+                trino_error_response(&query_id.0, &msg).into_response()
             }
         }
     } else {
@@ -638,7 +665,38 @@ pub async fn get_queued_statement(
             Err(e) => {
                 state.metrics.on_coordination_failure("queue_claim");
                 warn!("QueueCoordinator try_claim error: {e}");
-                // Fall through — allow local dispatch on coordinator failure.
+                let resp = queryflux_engine_adapters::trino::api::TrinoResponse {
+                    id: query_id.0.clone(),
+                    next_uri: None,
+                    info_uri: "http://queryflux/ui/query.html".to_string(),
+                    partial_cancel_uri: None,
+                    stats: queryflux_engine_adapters::trino::api::TrinoStats {
+                        state: "FAILED".to_string(),
+                        queued: false,
+                        scheduled: false,
+                        ..Default::default()
+                    },
+                    error: Some(queryflux_engine_adapters::trino::api::TrinoError {
+                        message: "Query coordination temporarily unavailable, please retry"
+                            .to_string(),
+                        error_code: Some(0),
+                        error_name: Some("TEMPORARILY_UNAVAILABLE".to_string()),
+                        error_type: Some("INTERNAL_ERROR".to_string()),
+                        failure_info: Default::default(),
+                    }),
+                    columns: None,
+                    data: None,
+                    update_type: None,
+                    update_count: None,
+                    warnings: vec![],
+                };
+                let json = serde_json::to_vec(&resp).unwrap_or_default();
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap()
+                    .into_response();
             }
         }
     }
@@ -737,7 +795,13 @@ pub async fn get_queued_statement(
             Err(e) => {
                 release_claim(&state, &query_id.0).await;
                 warn!(id = %query_id, "Dispatch error: {e}");
-                trino_error_response(&query_id.0, &e.to_string()).into_response()
+                let msg = client_safe_message(&e);
+                let msg = if msg.is_empty() {
+                    e.to_string()
+                } else {
+                    msg.to_string()
+                };
+                trino_error_response(&query_id.0, &msg).into_response()
             }
         }
     } else {
@@ -779,10 +843,13 @@ pub async fn get_executing_statement(
     // Authenticate the polling request when auth is enabled.
     let creds = extract_credentials(&headers);
     let auth_provider = state.live.read().await.auth_provider.clone();
-    if let Err(e) = auth_provider.authenticate(&creds).await {
-        warn!("Poll auth failed: {e}");
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!("Poll auth failed: {e}");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
 
     // trino_path = e.g. "queued/20260319_084733_00386_kqwci/1/token"
     //                 or "executing/20260319_084733_00386_kqwci/1/token"
@@ -801,6 +868,15 @@ pub async fn get_executing_statement(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
+    if auth_ctx.user != "anonymous" {
+        tracing::debug!(
+            id = %executing.id,
+            poll_user = %auth_ctx.user,
+            "Authenticated poll request — ownership check deferred until submitter is persisted"
+        );
+    }
 
     let adapter = match state.adapter(&executing.cluster_name.0).await {
         Some(a) => match a.as_async() {
@@ -874,7 +950,13 @@ pub async fn get_executing_statement(
     let poll_result = match adapter.poll_query(&backend_id, Some(&trino_url)).await {
         Ok(r) => r,
         Err(e) => {
-            warn!("Poll error: {e}");
+            if e.is_transient() {
+                warn!(id = %executing.id, "Transient poll error (will retry): {e}");
+                let next_uri = format!("{}/v1/statement/{}", state.external_address, trino_path);
+                let resp = queued_response(&executing.id.0, 0, next_uri);
+                return json_response(&resp).into_response();
+            }
+            error!(id = %executing.id, "Permanent poll error: {e}");
             state
                 .release_query_slot(
                     &executing.cluster_group,
@@ -882,8 +964,8 @@ pub async fn get_executing_statement(
                     &executing.id.0,
                 )
                 .await;
-            if let Err(e) = state.persistence.delete(&backend_id).await {
-                warn!(id = %executing.id, "Failed to delete executing record after poll error: {e}");
+            if let Err(del_err) = state.persistence.delete(&backend_id).await {
+                warn!(id = %executing.id, "Failed to delete executing record after poll error: {del_err}");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
@@ -955,6 +1037,7 @@ pub async fn get_executing_statement(
                         engine_stats,
                         guard_actions: submit_guard_actions,
                         was_guard_blocked: submit_was_guard_blocked,
+                        queue_duration_ms: 0,
                     },
                 );
                 state
@@ -990,6 +1073,7 @@ pub async fn get_executing_statement(
                     engine_stats: None,
                     guard_actions: submit_guard_actions,
                     was_guard_blocked: submit_was_guard_blocked,
+                    queue_duration_ms: 0,
                 },
             );
             state
@@ -1053,10 +1137,13 @@ pub async fn delete_executing_statement(
 ) -> impl IntoResponse {
     let creds = extract_credentials(&headers);
     let auth_provider = state.live.read().await.auth_provider.clone();
-    if let Err(e) = auth_provider.authenticate(&creds).await {
-        warn!("Cancel auth failed: {e}");
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!("Cancel auth failed: {e}");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
 
     let trino_id = match trino_path.split('/').nth(1) {
         Some(id) => id.to_string(),
@@ -1065,6 +1152,15 @@ pub async fn delete_executing_statement(
     let backend_id = BackendQueryId(trino_id);
 
     if let Ok(Some(executing)) = state.persistence.get(&backend_id).await {
+        // TODO: verify query ownership once submitter_user is stored in ExecutingQuery
+        if auth_ctx.user != "anonymous" {
+            tracing::debug!(
+                id = %executing.id,
+                cancel_user = %auth_ctx.user,
+                "Authenticated cancel request — ownership check deferred until submitter is persisted"
+            );
+        }
+
         let trino_url = format!(
             "{}/v1/statement/{}",
             executing

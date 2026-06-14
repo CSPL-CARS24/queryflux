@@ -519,6 +519,11 @@ pub struct QueryFluxConfig {
     /// Defaults to 30 seconds.
     #[serde(default)]
     pub shutdown_drain_timeout_secs: Option<u64>,
+    /// OpenTelemetry OTLP exporter endpoint (e.g. `http://localhost:4317`).
+    /// When set, QueryFlux exports distributed traces via gRPC OTLP.
+    /// Requires the binary to be built with `--features otlp`.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
 }
 
 impl QueryFluxConfig {
@@ -587,6 +592,10 @@ pub struct FrontendConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub port: u16,
+    /// Maximum concurrent connections this frontend will accept. New connections
+    /// beyond this limit are rejected immediately. `None` or `0` = unlimited.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
 }
 
 impl Default for FrontendConfig {
@@ -594,6 +603,7 @@ impl Default for FrontendConfig {
         Self {
             enabled: true,
             port: 8080,
+            max_connections: None,
         }
     }
 }
@@ -626,6 +636,14 @@ pub struct PostgresPersistenceConfig {
     /// and sweeps — raise this before adding replicas under high QPS.
     #[serde(default)]
     pub pool_size: Option<u32>,
+    /// Max seconds to wait for a connection from the pool before returning an error.
+    /// Defaults to 30 seconds.
+    #[serde(default)]
+    pub acquire_timeout_secs: Option<u64>,
+    /// Postgres `statement_timeout` set on each connection (seconds). Prevents
+    /// runaway queries from holding pool connections indefinitely. Defaults to 60s.
+    #[serde(default)]
+    pub statement_timeout_secs: Option<u64>,
 }
 
 impl PostgresPersistenceConfig {

@@ -284,7 +284,6 @@ impl AthenaAdapter {
                         "Athena query was cancelled".to_string(),
                     ));
                 }
-                // Running / Queued — keep polling.
                 _ => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }

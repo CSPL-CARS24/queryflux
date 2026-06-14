@@ -130,6 +130,10 @@ pub async fn dispatch_query(
         guard_chain,
         group_guard_chain,
         cluster_cfg,
+        // TODO: plumb max_queued_queries through LiveConfig. Add a field like
+        // `group_max_queued_queries: HashMap<String, Option<u64>>` to LiveConfig,
+        // populated from ClusterGroupConfig.max_queued_queries during reload.
+        max_queued_queries,
     ) = {
         let live = state.live.read().await;
         (
@@ -148,6 +152,7 @@ pub async fn dispatch_query(
             // cluster_cfg resolved after cluster selection below; captured here
             // so credential resolution uses the same config generation.
             live.cluster_configs.clone(),
+            None::<u64>,
         )
     };
 
@@ -173,6 +178,7 @@ pub async fn dispatch_query(
             group,
             already_queued,
             sequence,
+            max_queued_queries,
         )
         .await?;
         return Ok(DispatchOutcome::Queued {
@@ -195,6 +201,7 @@ pub async fn dispatch_query(
                         group,
                         already_queued,
                         sequence,
+                        max_queued_queries,
                     )
                     .await?;
                     return Ok(DispatchOutcome::Queued {
@@ -202,10 +209,6 @@ pub async fn dispatch_query(
                     });
                 }
                 CapacityGrant::Granted => c,
-                CapacityGrant::GrantedDegraded => {
-                    state.metrics.on_capacity_degraded(&group.0, &c.0);
-                    c
-                }
             }
         }
         None => {
@@ -218,6 +221,7 @@ pub async fn dispatch_query(
                 group,
                 already_queued,
                 sequence,
+                max_queued_queries,
             )
             .await?;
             return Ok(DispatchOutcome::Queued {
@@ -357,6 +361,7 @@ pub async fn dispatch_query(
                     engine_stats: None,
                     guard_actions: $actions,
                     was_guard_blocked: true,
+                    queue_duration_ms: 0,
                 },
             );
             slot.release().await;
@@ -418,6 +423,12 @@ pub async fn dispatch_query(
             if already_queued {
                 let _ = state.persistence.delete_queued(&query_id).await;
             }
+            let queue_duration_ms = queued_since
+                .map(|t| (Utc::now() - t).num_milliseconds().max(0) as u64)
+                .unwrap_or(0);
+            if queue_duration_ms > 0 {
+                debug!(id = %query_id, queue_ms = queue_duration_ms, "Queued query dispatched");
+            }
 
             // Extract backend_query_id first so we can build ExecutingQuery before branching.
             let backend_query_id = match &execution {
@@ -476,7 +487,10 @@ pub async fn dispatch_query(
                         )));
                     }
                     slot.disarm();
-                    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
+                    // TODO: persist queue_duration_ms so the poll handler can include it
+                    // in the final QueryOutcome. Either add a field to ExecutingQuery or
+                    // store it in a side-channel (e.g. a metadata column).
+                    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, queue_ms = queue_duration_ms, "Query submitted (async)");
 
                     let proxy_next_uri = poll_token
                         .as_deref()
@@ -532,6 +546,7 @@ pub async fn dispatch_query(
                         status,
                         error,
                         engine_stats,
+                        queue_duration_ms,
                     )
                     .await;
                     Ok(DispatchOutcome::Async {
@@ -562,6 +577,7 @@ async fn finalize_async_terminal_on_submit(
     status: QueryStatus,
     error: Option<String>,
     engine_stats: Option<QueryEngineStats>,
+    queue_duration_ms: u64,
 ) {
     let elapsed_ms = (Utc::now() - executing.creation_time)
         .num_milliseconds()
@@ -587,6 +603,7 @@ async fn finalize_async_terminal_on_submit(
         engine_stats,
         guard_actions: vec![],
         was_guard_blocked: false,
+        queue_duration_ms,
     };
     if !stored_actions.is_empty() {
         outcome.guard_actions = stored_actions;
@@ -688,18 +705,15 @@ async fn should_yield_to_older_queued(
 enum CapacityGrant {
     /// Capacity confirmed available by the coordination backend.
     Granted,
-    /// Coordination backend unreachable; proceeding on local limits only.
-    /// The replica is in degraded mode for this operation.
-    GrantedDegraded,
-    /// Global capacity is full — caller must queue or back off.
+    /// Global capacity is full or coordination backend unreachable (fail-closed) —
+    /// caller must queue or back off.
     Denied,
 }
 
 /// In distributed mode, take a global capacity lease for a cluster slot that
-/// was just acquired locally. Coordination failures fail open (proceed on local
-/// limits alone) and are counted in `queryflux_coordination_failures_total`.
-/// Returns `CapacityGrant::GrantedDegraded` in that case so callers can log or
-/// alert on degraded-mode admits. Always `Granted` outside distributed mode.
+/// was just acquired locally. Coordination failures fail closed (query is queued
+/// rather than admitted without global coordination) and are counted in
+/// `queryflux_coordination_failures_total`. Always `Granted` outside distributed mode.
 async fn acquire_global_capacity(
     state: &Arc<AppState>,
     cluster_manager: &Arc<dyn ClusterGroupManager>,
@@ -719,8 +733,10 @@ async fn acquire_global_capacity(
         Ok(false) => CapacityGrant::Denied,
         Err(e) => {
             state.metrics.on_coordination_failure("capacity_acquire");
-            tracing::warn!("CapacityStore try_acquire failed, allowing local: {e}");
-            CapacityGrant::GrantedDegraded
+            tracing::warn!(
+                "CapacityStore try_acquire failed, rejecting to queue (fail-closed): {e}"
+            );
+            CapacityGrant::Denied
         }
     }
 }
@@ -735,7 +751,28 @@ async fn persist_queued_query(
     group: ClusterGroupName,
     _already_stored: bool,
     sequence: u64,
+    max_queued_queries: Option<u64>,
 ) -> Result<String> {
+    // Enforce queue depth limit before admitting to the queue.
+    if let Some(limit) = max_queued_queries {
+        if limit > 0 {
+            let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
+            let count = state
+                .persistence
+                .count_active_queued_before(&group.0, None, active_after)
+                .await
+                .unwrap_or(0);
+            if count >= limit {
+                return Err(QueryFluxError::Other(anyhow::anyhow!(
+                    "Queue full for group '{}': {}/{} queued queries",
+                    group.0,
+                    count,
+                    limit
+                )));
+            }
+        }
+    }
+
     let now = Utc::now();
     let queued = QueuedQuery {
         id: query_id.clone(),
@@ -747,7 +784,7 @@ async fn persist_queued_query(
         last_accessed: now,
         sequence,
     };
-    let _ = state.persistence.upsert_queued(queued).await;
+    state.persistence.upsert_queued(queued).await?;
     let next_seq = sequence + 1;
     Ok(format!(
         "{}/v1/statement/qf/queued/{}/{}",
@@ -971,6 +1008,7 @@ impl From<SyncOutcome> for QueryOutcome {
             engine_stats: o.engine_stats,
             guard_actions: vec![],
             was_guard_blocked: false,
+            queue_duration_ms: 0,
         }
     }
 }
@@ -1029,14 +1067,12 @@ async fn setup_sync_query(
                     .await
                 {
                     CapacityGrant::Denied => {
-                        // Global capacity full — release local slot and retry with backoff.
+                        // Global capacity full or coordination unavailable (fail-closed) —
+                        // release local slot and retry with backoff.
                         let _ = cluster_manager.release_cluster(&group, &name).await;
                         queued_backoff_delay(seq).await;
                         seq += 1;
                         continue;
-                    }
-                    CapacityGrant::GrantedDegraded => {
-                        state.metrics.on_capacity_degraded(&group.0, &name.0);
                     }
                     CapacityGrant::Granted => {}
                 }
@@ -1129,6 +1165,7 @@ async fn setup_sync_query(
                     engine_stats: None,
                     guard_actions: vec![],
                     was_guard_blocked: false,
+                    queue_duration_ms: 0,
                 },
             );
             slot.release().await;
@@ -1544,6 +1581,7 @@ pub async fn execute_to_sink(
                         engine_stats: None,
                         guard_actions: all_actions,
                         was_guard_blocked: true,
+                        queue_duration_ms: 0,
                     },
                 );
                 return sink.on_error(&deny_reason).await;

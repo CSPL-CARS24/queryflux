@@ -308,8 +308,8 @@ impl TestHarness {
                 .expect("build shared http client"),
         });
 
-        let trino_fe = TrinoHttpFrontend::new(state.clone(), port);
-        let snowflake_fe = SnowflakeFrontend::new(state, port);
+        let trino_fe = TrinoHttpFrontend::new(state.clone(), port, None);
+        let snowflake_fe = SnowflakeFrontend::new(state, port, None);
         // Serve both Trino HTTP (/v1/statement) and Snowflake SQL API v2 (/api/v2/statements)
         // on the same port so query-params e2e tests can use the Snowflake protocol with bindings.
         let router: Router = trino_fe.router().merge(snowflake_fe.router());

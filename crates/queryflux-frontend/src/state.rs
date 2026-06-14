@@ -127,6 +127,9 @@ pub struct QueryOutcome {
     pub guard_actions: Vec<GuardAction>,
     /// True if any guard returned Deny — fast filter for Studio.
     pub was_guard_blocked: bool,
+    /// Milliseconds spent waiting in the proxy queue before dispatch.
+    /// Zero for queries that were dispatched immediately.
+    pub queue_duration_ms: u64,
 }
 
 impl AppState {
@@ -222,7 +225,7 @@ impl AppState {
                 .routing_trace
                 .as_ref()
                 .and_then(|t| serde_json::to_value(t).ok()),
-            queue_duration_ms: 0,
+            queue_duration_ms: outcome.queue_duration_ms,
             execution_duration_ms: outcome.execution_ms,
             rows_returned: outcome.rows,
             error_message: outcome.error,
