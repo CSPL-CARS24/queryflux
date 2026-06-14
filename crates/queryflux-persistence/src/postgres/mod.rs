@@ -1613,34 +1613,53 @@ impl ConfigRevisionStore for PostgresStore {
     }
 
     async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
-        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool)
-            .await
-            .map_err(|e| {
-                QueryFluxError::Persistence(format!("PgListener connect for config_revision: {e}"))
-            })?;
-
-        listener
-            .listen("config_revision_changed")
-            .await
-            .map_err(|e| {
-                QueryFluxError::Persistence(format!(
-                    "PgListener LISTEN config_revision_changed: {e}"
-                ))
-            })?;
-
+        let pool = self.pool.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(16);
 
         tokio::spawn(async move {
-            loop {
-                match listener.recv().await {
-                    Ok(notification) => {
-                        let rev = notification.payload().parse::<u64>().unwrap_or(0);
-                        if tx.send(rev).await.is_err() {
-                            break;
-                        }
-                    }
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut backoff = std::time::Duration::from_secs(1);
+
+            'reconnect: loop {
+                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(l) => l,
                     Err(e) => {
-                        tracing::warn!("PgListener config_revision recv error: {e}");
+                        tracing::warn!(
+                            "PgListener connect failed, retrying in {backoff:?}: {e}"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = listener.listen("config_revision_changed").await {
+                    tracing::warn!(
+                        "PgListener LISTEN failed, retrying in {backoff:?}: {e}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+
+                backoff = std::time::Duration::from_secs(1);
+
+                loop {
+                    match listener.recv().await {
+                        Ok(notification) => {
+                            let rev = notification.payload().parse::<u64>().unwrap_or(0);
+                            if tx.send(rev).await.is_err() {
+                                break 'reconnect;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "PgListener recv error, reconnecting in {backoff:?}: {e}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                            break; // drop listener, reconnect from outer loop
+                        }
                     }
                 }
             }
