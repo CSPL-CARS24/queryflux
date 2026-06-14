@@ -1624,9 +1624,7 @@ impl ConfigRevisionStore for PostgresStore {
                 let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
                     Ok(l) => l,
                     Err(e) => {
-                        tracing::warn!(
-                            "PgListener connect failed, retrying in {backoff:?}: {e}"
-                        );
+                        tracing::warn!("PgListener connect failed, retrying in {backoff:?}: {e}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
@@ -1634,9 +1632,7 @@ impl ConfigRevisionStore for PostgresStore {
                 };
 
                 if let Err(e) = listener.listen("config_revision_changed").await {
-                    tracing::warn!(
-                        "PgListener LISTEN failed, retrying in {backoff:?}: {e}"
-                    );
+                    tracing::warn!("PgListener LISTEN failed, retrying in {backoff:?}: {e}");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue;
