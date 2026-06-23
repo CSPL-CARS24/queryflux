@@ -1534,11 +1534,7 @@ async fn main() -> Result<()> {
         let cfg = config.queryflux.frontends.snowflake_http.clone();
         async move {
             match cfg {
-                Some(c) if c.enabled => {
-                    SnowflakeFrontend::new(state, c.port, c.max_connections)
-                        .listen(rx)
-                        .await
-                }
+                Some(c) if c.enabled => SnowflakeFrontend::new(state, c).listen(rx).await,
                 _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
         }

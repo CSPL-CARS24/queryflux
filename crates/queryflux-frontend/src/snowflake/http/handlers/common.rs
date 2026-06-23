@@ -33,6 +33,14 @@ pub fn parse_snowflake_json_body(headers: &HeaderMap, body: &Bytes) -> Result<Va
     serde_json::from_slice(&decoded).map_err(|e| e.to_string())
 }
 
+/// Extract the session token from `Authorization: Snowflake Token="<token>"`.
+/// Returns `None` if the header is absent or does not match the expected format.
+pub fn extract_snowflake_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("authorization")?.to_str().ok()?;
+    let stripped = value.trim().strip_prefix("Snowflake Token=")?;
+    Some(stripped.trim_matches('"').to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

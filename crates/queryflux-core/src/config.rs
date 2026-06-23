@@ -583,7 +583,7 @@ pub struct FrontendsConfig {
     #[serde(default)]
     pub flight_sql: Option<FrontendConfig>,
     #[serde(default)]
-    pub snowflake_http: Option<FrontendConfig>,
+    pub snowflake_http: Option<SnowflakeHttpFrontendConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,6 +606,37 @@ impl Default for FrontendConfig {
             max_connections: None,
         }
     }
+}
+
+/// Config for the Snowflake frontend (HTTP wire v1 + SQL API v2 on the same port).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnowflakeHttpFrontendConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub port: u16,
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Must be set to `true` when running multiple QueryFlux replicas to acknowledge that
+    /// the load balancer is configured for sticky session affinity. A warning is logged at
+    /// startup when this is `false`, because HTTP wire v1 sessions are process-local and
+    /// clients will break if requests are routed to a different replica.
+    #[serde(default)]
+    pub session_affinity_acknowledged: bool,
+    /// Maximum session lifetime in seconds. 0 = no limit. Default: 86400 (24 h).
+    #[serde(default = "default_session_max_age_secs")]
+    pub session_max_age_secs: u64,
+    /// Session idle timeout in seconds. 0 = no limit. Default: 14400 (4 h).
+    #[serde(default = "default_session_idle_timeout_secs")]
+    pub session_idle_timeout_secs: u64,
+}
+
+fn default_session_max_age_secs() -> u64 {
+    86400
+}
+
+fn default_session_idle_timeout_secs() -> u64 {
+    14400
 }
 
 fn default_true() -> bool {
