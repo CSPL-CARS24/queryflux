@@ -120,27 +120,19 @@ impl SqlApiSink {
 
 /// A column pre-cast to Utf8 so the conversion happens once per batch, not once per cell.
 enum CastColumn {
-    Strings(Arc<StringArray>),
+    Strings(Arc<dyn Array>),
     /// Values we cannot stringify for JSON without corrupting data.
     Unsupported,
 }
 
 impl CastColumn {
     fn new(arr: &Arc<dyn Array>) -> Self {
-        let utf8 = if *arr.data_type() == DataType::Utf8 {
-            Some(Arc::clone(arr))
-        } else {
-            arrow_cast(arr, &DataType::Utf8).ok()
-        };
-        match utf8.and_then(|a| {
-            a.as_any().downcast_ref::<StringArray>().map(|s| {
-                // SAFETY: we just confirmed the array is DataType::Utf8, so StringArray is the
-                // correct concrete type. The downcast cannot fail here.
-                Arc::new(s.clone())
-            })
-        }) {
-            Some(sa) => Self::Strings(sa),
-            None => Self::Unsupported,
+        if *arr.data_type() == DataType::Utf8 {
+            return Self::Strings(Arc::clone(arr));
+        }
+        match arrow_cast(arr, &DataType::Utf8) {
+            Ok(casted) => Self::Strings(casted),
+            Err(_) => Self::Unsupported,
         }
     }
 
@@ -148,10 +140,10 @@ impl CastColumn {
         match self {
             Self::Strings(arr) => {
                 if arr.is_null(row) {
-                    Value::Null
-                } else {
-                    Value::String(arr.value(row).to_string())
+                    return Value::Null;
                 }
+                let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                Value::String(str_arr.value(row).to_string())
             }
             Self::Unsupported => Value::Null,
         }
@@ -313,8 +305,8 @@ async fn authenticate(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    let auth_provider = state.live.read().await.auth_provider.clone();
-    auth_provider
+    state
+        .auth_provider
         .authenticate(&Credentials {
             username: None,
             password: None,

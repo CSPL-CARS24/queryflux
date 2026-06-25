@@ -11,7 +11,7 @@ use axum::{
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::{FrontendListenerTrait, ShutdownRx};
+use crate::FrontendListenerTrait;
 use handlers::*;
 use queryflux_core::error::Result;
 use state::AppState;
@@ -19,16 +19,11 @@ use state::AppState;
 pub struct TrinoHttpFrontend {
     pub state: Arc<AppState>,
     pub port: u16,
-    pub max_connections: Option<usize>,
 }
 
 impl TrinoHttpFrontend {
-    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
-        Self {
-            state,
-            port,
-            max_connections,
-        }
+    pub fn new(state: Arc<AppState>, port: u16) -> Self {
+        Self { state, port }
     }
 
     pub fn router(&self) -> Router {
@@ -52,28 +47,13 @@ impl TrinoHttpFrontend {
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for TrinoHttpFrontend {
-    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
+    async fn listen(&self) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!("Trino HTTP frontend listening on {addr}");
-        if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
-            info!(
-                max_connections = limit,
-                "Concurrent request limit enabled (idle keep-alive clients do not count)"
-            );
-        }
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Other(e.into()))?;
-        let router = if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
-            self.router()
-                .layer(tower::limit::ConcurrencyLimitLayer::new(limit))
-        } else {
-            self.router()
-        };
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown.changed().await;
-            })
+        axum::serve(listener, self.router())
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Other(e.into()))?;
         Ok(())

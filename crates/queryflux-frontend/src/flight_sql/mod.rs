@@ -43,29 +43,24 @@ use queryflux_core::{
 
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::{FrontendListenerTrait, ShutdownRx};
+use crate::FrontendListenerTrait;
 
 // ── Frontend listener ─────────────────────────────────────────────────────────
 
 pub struct FlightSqlFrontend {
     state: Arc<AppState>,
     port: u16,
-    max_connections: Option<usize>,
 }
 
 impl FlightSqlFrontend {
-    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
-        Self {
-            state,
-            port,
-            max_connections,
-        }
+    pub fn new(state: Arc<AppState>, port: u16) -> Self {
+        Self { state, port }
     }
 }
 
 #[async_trait]
 impl FrontendListenerTrait for FlightSqlFrontend {
-    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
+    async fn listen(&self) -> Result<()> {
         let addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.port)
             .parse()
             .map_err(|e: std::net::AddrParseError| QueryFluxError::Other(e.into()))?;
@@ -75,15 +70,9 @@ impl FrontendListenerTrait for FlightSqlFrontend {
         let service = QueryFluxFlightSql::new(self.state.clone());
         let flight_server = FlightServiceServer::new(service);
 
-        let mut builder = tonic::transport::Server::builder();
-        if let Some(limit) = self.max_connections.filter(|&l| l > 0) {
-            builder = builder.concurrency_limit_per_connection(limit);
-        }
-        builder
+        tonic::transport::Server::builder()
             .add_service(flight_server)
-            .serve_with_shutdown(addr, async move {
-                let _ = shutdown.changed().await;
-            })
+            .serve(addr)
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))
     }
@@ -194,8 +183,9 @@ impl FlightSqlService for QueryFluxFlightSql {
             bearer_token: bearer,
             ..Default::default()
         };
-        let auth_provider = self.state.live.read().await.auth_provider.clone();
-        let auth_ctx = auth_provider
+        let auth_ctx = self
+            .state
+            .auth_provider
             .authenticate(&creds)
             .await
             .map_err(|e| Status::unauthenticated(e.to_string()))?;

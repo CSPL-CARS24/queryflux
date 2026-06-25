@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use queryflux_core::config::{ClusterConfig, QueryAuthConfig, TokenExchangeConfig};
 use queryflux_core::error::{QueryFluxError, Result};
-use tracing::{debug, error};
+use tracing::{debug, warn};
 
 use crate::credentials::{AuthContext, QueryCredentials};
 
@@ -36,10 +36,7 @@ pub struct BackendIdentityResolver {
 impl BackendIdentityResolver {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("build token-exchange http client"),
+            http_client: reqwest::Client::new(),
             token_cache: Arc::new(DashMap::new()),
         }
     }
@@ -48,21 +45,17 @@ impl BackendIdentityResolver {
     ///
     /// `cluster_cfg` is `None` when the cluster name is not in the config map
     /// (e.g. dynamically registered clusters) — falls back to `ServiceAccount`.
-    ///
-    /// Returns `Err` when `tokenExchange` is configured but the exchange fails. The
-    /// caller must surface this as an auth error rather than silently substituting the
-    /// service-account identity (which would send the query with the wrong principal).
     pub async fn resolve(
         &self,
         auth_ctx: &AuthContext,
         cluster_cfg: Option<&ClusterConfig>,
-    ) -> Result<QueryCredentials> {
+    ) -> QueryCredentials {
         // Anonymous identity → always service account regardless of cluster config.
         if auth_ctx.user == "anonymous" {
-            return Ok(QueryCredentials::ServiceAccount);
+            return QueryCredentials::ServiceAccount;
         }
 
-        let creds = match cluster_cfg.and_then(|c| c.query_auth.as_ref()) {
+        match cluster_cfg.and_then(|c| c.query_auth.as_ref()) {
             None | Some(QueryAuthConfig::ServiceAccount) => QueryCredentials::ServiceAccount,
 
             Some(QueryAuthConfig::Impersonate) => QueryCredentials::Impersonate {
@@ -73,20 +66,16 @@ impl BackendIdentityResolver {
                 match self.exchange_token(auth_ctx, cfg).await {
                     Ok(token) => QueryCredentials::Bearer { token },
                     Err(e) => {
-                        // Do NOT fall back to ServiceAccount — that would submit the query
-                        // under the wrong identity. Propagate the error so the caller
-                        // returns a proper auth failure to the client.
-                        error!(
+                        warn!(
                             user = %auth_ctx.user,
                             error = %e,
-                            "tokenExchange failed — rejecting query"
+                            "tokenExchange failed — falling back to serviceAccount"
                         );
-                        return Err(e);
+                        QueryCredentials::ServiceAccount
                     }
                 }
             }
-        };
-        Ok(creds)
+        }
     }
 
     async fn exchange_token(
@@ -173,12 +162,6 @@ impl BackendIdentityResolver {
 
         self.token_cache
             .insert(cache_key, (token.clone(), expires_at));
-
-        // Sweep expired entries on each write to keep the map bounded. The map
-        // holds at most one entry per (user, token_endpoint) pair, so this is
-        // cheap in practice and avoids a separate background task.
-        let now = Instant::now();
-        self.token_cache.retain(|_, (_, exp)| *exp > now);
 
         Ok(token)
     }
